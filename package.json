@@ -4,7 +4,10 @@
   "description": "Hermes Control Interface web dashboard",
   "main": "server.js",
   "scripts": {
-    "start": "PORT=10272 node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "setup": "bash install.sh",
+    "test": "node --test"
   },
   "dependencies": {
     "dotenv": "^16.3.1",

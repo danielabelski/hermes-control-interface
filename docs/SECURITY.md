@@ -1,34 +1,64 @@
-# Security
+# Security Analysis
 
-This dashboard exposes a real terminal and file editor. Treat it like root access, because that is effectively what it is.
+## Authentication
 
-## Security model
+**Password storage:** Plaintext comparison against the value in `HERMES_CONTROL_PASSWORD`. The password itself is never stored — only the live environment variable. Use a long, random value in production.
 
-- UI access requires login
-- Auth cookies are HMAC-protected
-- Internal cron endpoints require `HERMES_CONTROL_SECRET`
-- The server refuses to start if `HERMES_CONTROL_PASSWORD` or `HERMES_CONTROL_SECRET` are missing
+**Password comparison:** Uses `crypto.timingSafeEqual` to prevent timing oracle attacks. This eliminates timing side-channels in the comparison itself.
 
-## Hard rules
+**Auth tokens:** HMAC-SHA256 signed tokens stored in an HttpOnly cookie. Tokens contain a Unix timestamp and are valid for 24 hours. The signature prevents tampering or forgery.
 
-- Do not commit `.env`
-- Do not commit `node_modules`
-- Do not hardcode machine-specific paths
-- Do not expose the raw port to the internet without TLS and a reverse proxy
+**Rate limiting:** IPs are blocked from authenticating after 5 failed attempts within a 15-minute window. This does not prevent brute-force attacks entirely but significantly raises the cost.
 
-## Recommended production setup
+**Weaknesses:**
+- Single shared password — no per-user isolation
+- No MFA
+- No login attempt notification (could silently tolerate brute force if attacker has enough time)
 
-- Bind the app to localhost
-- Put nginx or Caddy in front of it
-- Terminate TLS at the proxy
-- Restrict access by IP or VPN if possible
-- Use a unique strong password and secret per deployment
+## Cookies
 
-## Things to audit before publishing
+| Attribute | Value |
+|---|---|
+| `HttpOnly` | Yes — not accessible to JavaScript |
+| `SameSite` | `Lax` — sent on top-level navigations and same-site subrequests |
+| `Secure` | Yes — only sent over HTTPS |
+| `Max-Age` | 86400 seconds (24 hours) |
 
-- Password handling
-- Cookie flags
-- WebSocket auth
-- Internal API auth
-- Any path that writes to disk
-- Any hardcoded path or secret left in source
+The `Secure` flag means cookies are suppressed over plain HTTP. If you expose this service without HTTPS (e.g. direct LAN access on `http://`), the login cookie won't work. Use a reverse-proxy with TLS termination in front.
+
+## File Operations
+
+File read and write operations are scoped to the configured explorer roots. Path traversal attempts outside these roots are rejected with a `403`-style error.
+
+```
+isAllowedPath(filePath):
+  resolve(filePath) must equal OR be inside resolve(root)
+  for at least one configured root
+```
+
+The explorer also ignores `node_modules`, `.git`, and other sensitive directories.
+
+## No External Network Access
+
+The server makes no outbound HTTP requests. It only:
+- reads local files within explorer roots
+- spawns a PTY shell
+- communicates over WebSocket with authenticated clients
+
+## WebSocket
+
+The `/ws` endpoint requires an authenticated session cookie. Unauthenticated WebSocket connections receive no data.
+
+## What This Is Not
+
+- **Not multi-user.** All browser sessions share the same password. Treat it like a root password.
+- **Not hardened for hostile networks.** Designed for trusted LANs or HTTPS-reverse-proxied deployments.
+- **Not audited.** This analysis is a surface-level review, not a formal security audit.
+
+## Recommendations for Production
+
+1. **Use HTTPS.** Always. Either behind an nginx reverse-proxy or on a platform that provides TLS.
+2. **Use a strong, randomly generated password.** Minimum 32 characters.
+3. **Rotate secrets periodically.** A rotated `HERMES_CONTROL_SECRET` invalidates all existing sessions.
+4. **Don't expose to the public internet** without a reverse-proxy and rate limiting.
+5. **Consider IP allowlisting** at the firewall or nginx level if access is limited to specific IPs.
