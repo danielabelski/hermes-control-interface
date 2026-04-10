@@ -32,8 +32,6 @@
       <div class="subtitle">embedded Hermes CLI • root@hermes</div>
     </div>
     <div class="topbar-center">
-      <span class="pill" id="status-pill">LOCKED</span>
-      <span class="pill" id="model-pill">model…</span>
     </div>
     <div class="topbar-right">
       <span id="clock">--:--:--</span>
@@ -64,6 +62,8 @@
       <div class="sidebar-agent-shadow"></div>
     </div>
     <div class="sidebar-agent-info">
+      <div id="sidebar-agent-status" class="sidebar-agent-status">LOCKED</div>
+      <div id="sidebar-agent-model" class="sidebar-agent-model">loading…</div>
       <div id="sidebar-agent-details" class="sidebar-agent-details">standby</div>
     </div>
     <div class="sidebar-agent-controls">
@@ -164,6 +164,35 @@
             <div class="panel-head-right"><span class="mini-dot amber"></span><span class="mini-label" id="token-provider">router</span></div>
           </div>
           <div class="panel-body" id="tokens-panel"></div>
+          <div class="resize-handle"></div>
+        </article>
+
+        <article class="panel logs-panel" data-panel-id="logs" data-x="50" data-y="46" data-w="50" data-h="20">
+          <div class="panel-head drag-handle">
+            <span>LOGS</span>
+            <div class="panel-head-right">
+              <span class="mini-dot green"></span>
+              <span class="mini-label" id="log-status">idle</span>
+              <button id="log-pause-btn" class="ghost-btn panel-action" type="button">pause</button>
+            </div>
+          </div>
+          <div class="panel-body logs-body">
+            <div class="logs-toolbar">
+              <div class="logs-tabs">
+                <button class="ghost-btn log-tab active" data-log="agent">Agent</button>
+                <button class="ghost-btn log-tab" data-log="errors">Errors</button>
+                <button class="ghost-btn log-tab" data-log="gateway">Gateway</button>
+              </div>
+              <select id="log-level" class="log-level-select">
+                <option value="">All</option>
+                <option value="DEBUG">DEBUG</option>
+                <option value="INFO">INFO</option>
+                <option value="WARNING">WARN</option>
+                <option value="ERROR">ERROR</option>
+              </select>
+            </div>
+            <div id="logs-output" class="logs-output"></div>
+          </div>
           <div class="resize-handle"></div>
         </article>
       </div>

@@ -102,10 +102,29 @@ body {
 .sidebar-info h1, .sidebar-info h2, .sidebar-info h3 { color: #ede6d4; font-size: 12px; margin: 8px 0 4px; }
 .sidebar-info pre { background: rgba(0,0,0,0.3); padding: 6px 8px; border-radius: 4px; overflow-x: auto; font-size: 10px; margin: 4px 0; }
 .sidebar-info code { font-family: 'JetBrains Mono', monospace; }
+
+/* Logs panel */
+.logs-body { display: flex; flex-direction: column; height: 100%; padding: 0 !important; }
+.logs-toolbar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--line-soft); flex-shrink: 0; }
+.logs-tabs { display: flex; gap: 4px; }
+.logs-tabs .log-tab { font-size: 10px; padding: 3px 8px; min-height: auto; }
+.logs-tabs .log-tab.active { border-color: rgba(103, 240, 162, 0.6); color: #67fb7f; background: rgba(103, 240, 162, 0.08); }
+.log-level-select { background: #0e121b; color: #ede6d4; border: 1px solid rgba(244, 199, 92, 0.3); border-radius: 4px; padding: 2px 6px; font-size: 10px; font-family: 'JetBrains Mono', monospace; margin-left: auto; }
+.logs-output { flex: 1; overflow-y: auto; padding: 6px 10px; font-size: 11px; font-family: 'JetBrains Mono', monospace; line-height: 1.6; color: #9ca3af; }
+.logs-output .log-line { white-space: pre-wrap; word-break: break-all; }
+.logs-output .log-line .log-time { color: #6b7280; }
+.logs-output .log-line .log-level-INFO { color: #9ad7ff; }
+.logs-output .log-line .log-level-WARNING { color: #f4c75c; }
+.logs-output .log-line .log-level-ERROR { color: #ff7171; }
+.logs-output .log-line .log-level-DEBUG { color: #6b7280; }
 .sidebar-agent-shadow { position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); width: 80px; height: 12px; background: radial-gradient(ellipse, rgba(0,0,0,0.5) 0%, transparent 70%); }
 .sidebar-agent-info { text-align: center; width: 100%; margin-top: 6px; }
 .sidebar-agent-state { font-size: 13px; font-weight: 600; color: var(--gold); text-transform: capitalize; }
 .sidebar-agent-details { font-size: 10px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sidebar-agent-status { font-size: 12px; font-weight: 700; letter-spacing: 0.1em; margin-bottom: 2px; }
+.sidebar-agent-status.live { color: #67fb7f; }
+.sidebar-agent-status.locked { color: #f4c75c; }
+.sidebar-agent-model { font-size: 10px; color: #9ad7ff; margin-bottom: 2px; }
 .sidebar-agent-controls { display: flex; gap: 6px; margin-top: 8px; padding: 0 2px; width: 100%; }
 .sidebar-agent-controls .ghost-btn { flex: 1; font-size: 10px; padding: 4px 0; }
 .sessions-list { display: flex; flex-direction: column; gap: 4px; max-height: 240px; overflow-y: auto; }

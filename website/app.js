@@ -56,8 +56,8 @@ const els = {
   loginForm: $('#login-form'),
   passwordInput: $('#password-input'),
   loginError: $('#login-error'),
-  statusPill: $('#status-pill'),
-  modelPill: $('#model-pill'),
+  sidebarAgentStatus: $('#sidebar-agent-status'),
+  sidebarAgentModel: $('#sidebar-agent-model'),
   clock: $('#clock'),
   refreshBtn: $('#refresh-btn'),
   layoutEditBtn: $('#layout-edit-btn'),
@@ -652,7 +652,7 @@ function renderTokens(snapshot) {
     <div class="metric-row full-span" style="padding:6px 0;">
       <div class="insights-filters" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;">
         ${[1, 7, 30].map(d => `<button class="ghost-btn filter-btn ${activeDays === d ? 'active' : ''}" data-days="${d}" data-source="${activeSource}" style="font-size:10px;padding:3px 8px;min-height:auto;">${d === 1 ? 'Today' : d + 'd'}</button>`).join('')}
-        <select class="insights-source" style="margin-left:auto;background:rgba(0,0,0,0.3);color:#ede6d4;border:1px solid rgba(244,199,92,0.3);border-radius:4px;padding:2px 6px;font-size:10px;font-family:'JetBrains Mono',monospace;">
+        <select class="insights-source" style="margin-left:auto;background:#0e121b;color:#ede6d4;border:1px solid rgba(244,199,92,0.3);border-radius:4px;padding:2px 6px;font-size:10px;font-family:'JetBrains Mono',monospace;">
           ${sources.map(s => `<option value="${s}" ${activeSource === s ? 'selected' : ''}>${s}</option>`).join('')}
         </select>
       </div>
@@ -1137,11 +1137,14 @@ function renderSnapshot(snapshot) {
   const prev = state.snapshot;
   state.snapshot = snapshot;
   document.title = `Hermes Control Interface • ${snapshot.agent?.state || 'idle'}`;
-  if (els.statusPill) {
-    els.statusPill.textContent = snapshot.authed ? 'LIVE' : 'LOCKED';
-    els.statusPill.className = `pill ${snapshot.authed ? 'good' : 'warn'}`;
+  if (els.sidebarAgentStatus) {
+    const isLive = snapshot.authed;
+    els.sidebarAgentStatus.textContent = isLive ? 'LIVE' : 'LOCKED';
+    els.sidebarAgentStatus.className = `sidebar-agent-status ${isLive ? 'live' : 'locked'}`;
   }
-  if (els.modelPill) els.modelPill.textContent = snapshot.configSummary?.defaultModel || snapshot.models?.[0]?.value || 'model';
+  if (els.sidebarAgentModel) {
+    els.sidebarAgentModel.textContent = snapshot.configSummary?.defaultModel || 'unknown';
+  }
   if (els.terminalLabel) els.terminalLabel.textContent = snapshot.loginIdentity || 'root@hermes';
   if (els.terminalPrompt) els.terminalPrompt.textContent = snapshot.terminal?.prompt || `${snapshot.loginIdentity || 'root@hermes'}:${snapshot.terminal?.cwd || snapshot.workingDir || '/'}#`;
 
@@ -1208,6 +1211,15 @@ function connectWs() {
           state.snapshot.system = data.payload;
           renderSystem(state.snapshot);
         }
+      }
+      if (data.type === 'log-stream') {
+        appendLogLines(data.data || '');
+        const status = document.getElementById('log-status');
+        if (status) status.textContent = 'live';
+      }
+      if (data.type === 'log-stream-start') {
+        const status = document.getElementById('log-status');
+        if (status) status.textContent = 'live';
       }
     } catch {}
   });
@@ -1507,12 +1519,84 @@ function initDragResize() {
   applyLayout();
 }
 
+// Log streaming
+const logState = { type: 'agent', level: '', paused: false, lineCount: 0 };
+const MAX_LOG_LINES = 500;
+
+function startLogStream(logType, level) {
+  logState.type = logType || 'agent';
+  logState.level = level || '';
+  logState.paused = false;
+  logState.lineCount = 0;
+  const output = document.getElementById('logs-output');
+  if (output) output.innerHTML = '';
+  const status = document.getElementById('log-status');
+  if (status) status.textContent = 'connecting…';
+  if (state.socket?.readyState === WebSocket.OPEN) {
+    state.socket.send(JSON.stringify({ type: 'log-start', logType: logState.type, level: logState.level }));
+  }
+}
+
+function stopLogStream() {
+  if (state.socket?.readyState === WebSocket.OPEN) {
+    state.socket.send(JSON.stringify({ type: 'log-stop' }));
+  }
+  const status = document.getElementById('log-status');
+  if (status) status.textContent = 'idle';
+}
+
+function appendLogLines(data) {
+  if (logState.paused) return;
+  const output = document.getElementById('logs-output');
+  if (!output) return;
+  const lines = data.split('\n').filter(l => l.trim());
+  for (const line of lines) {
+    if (logState.lineCount >= MAX_LOG_LINES) {
+      output.removeChild(output.firstChild);
+    } else {
+      logState.lineCount++;
+    }
+    const div = document.createElement('div');
+    div.className = 'log-line';
+    // Color-code log level
+    const levelMatch = line.match(/\b(DEBUG|INFO|WARNING|ERROR)\b/);
+    const levelClass = levelMatch ? `log-level-${levelMatch[1]}` : '';
+    div.innerHTML = `<span class="${levelClass}">${escapeHtml(line)}</span>`;
+    output.appendChild(div);
+  }
+  // Auto-scroll to bottom
+  output.scrollTop = output.scrollHeight;
+}
+
 function bindUi() {
 
 
 
   els.refreshBtn.addEventListener('click', fetchSnapshot);
   document.getElementById('auto-refresh-btn')?.addEventListener('click', toggleAutoRefresh);
+
+  // Log panel bindings
+  document.querySelectorAll('.log-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.log-tab').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      const logType = tab.dataset.log;
+      const level = document.getElementById('log-level')?.value || '';
+      startLogStream(logType, level);
+    });
+  });
+  document.getElementById('log-level')?.addEventListener('change', (e) => {
+    const activeTab = document.querySelector('.log-tab.active');
+    const logType = activeTab?.dataset.log || 'agent';
+    startLogStream(logType, e.target.value);
+  });
+  document.getElementById('log-pause-btn')?.addEventListener('click', () => {
+    logState.paused = !logState.paused;
+    const btn = document.getElementById('log-pause-btn');
+    if (btn) btn.textContent = logState.paused ? 'resume' : 'pause';
+    const status = document.getElementById('log-status');
+    if (status) status.textContent = logState.paused ? 'paused' : 'live';
+  });
   els.layoutEditBtn?.addEventListener('click', () => setLayoutEditMode(!state.layoutEditMode));
   els.layoutSaveBtn?.addEventListener('click', async () => {
     try {
@@ -1660,6 +1744,8 @@ async function boot() {
     await loadLayoutState();
     await fetchSnapshot();
     startAutoRefresh();
+    // Start log stream (agent logs, default level)
+    setTimeout(() => startLogStream('agent', ''), 1000);
   } else {
     setLocked(true);
   }

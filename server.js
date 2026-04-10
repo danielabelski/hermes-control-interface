@@ -6,7 +6,7 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const pty = require('node-pty');
 const { WebSocketServer } = require('ws');
 const rateLimit = require('express-rate-limit');
@@ -96,6 +96,8 @@ app.use('/vendor/xterm-addon-fit', express.static(path.join(__dirname, 'node_mod
 
 const sessions = new Map();
 const events = [];
+// Log streaming state
+let logStream = { proc: null, type: null, level: null, clients: new Set() };
 let hermesSidebarSessionsCache = { at: 0, data: [] };
 const cronJobs = [];
 const quickActions = [
@@ -309,6 +311,49 @@ function broadcastToClients(message) {
   for (const client of wss?.clients || []) {
     if (client.readyState === 1 && client.authed) client.send(payload);
   }
+}
+
+function startLogStream(logType, level, socket) {
+  // Kill existing stream
+  stopLogStream();
+  const args = ['logs', logType || 'agent', '-f', '-n', '200'];
+  if (level) args.push('--level', level);
+  logStream.proc = spawn('hermes', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  logStream.type = logType || 'agent';
+  logStream.level = level || 'all';
+  logStream.clients.add(socket);
+  let buffer = '';
+  let flushTimer = null;
+  const flush = () => {
+    if (buffer && socket.readyState === 1) {
+      socket.send(JSON.stringify({ type: 'log-stream', logType: logStream.type, data: buffer }));
+      buffer = '';
+    }
+    flushTimer = null;
+  };
+  logStream.proc.stdout.on('data', (chunk) => {
+    buffer += chunk.toString();
+    if (!flushTimer) flushTimer = setTimeout(flush, 200);
+  });
+  logStream.proc.stderr.on('data', (chunk) => {
+    buffer += chunk.toString();
+    if (!flushTimer) flushTimer = setTimeout(flush, 200);
+  });
+  logStream.proc.on('close', () => {
+    if (flushTimer) clearTimeout(flushTimer);
+    flush();
+    logStream.proc = null;
+  });
+  // Send initial confirmation
+  socket.send(JSON.stringify({ type: 'log-stream-start', logType: logStream.type, level: logStream.level }));
+}
+
+function stopLogStream() {
+  if (logStream.proc) {
+    try { logStream.proc.kill('SIGTERM'); } catch {}
+    logStream.proc = null;
+  }
+  logStream.clients.clear();
 }
 
 function appendTerminalOutput(chunk) {
@@ -1314,6 +1359,12 @@ wss.on('connection', async (socket, req) => {
         terminalSession.cols = cols;
         terminalSession.rows = rows;
         if (terminalSession.proc && terminalSession.proc.resize) terminalSession.proc.resize(cols, rows);
+      }
+      if (msg.type === 'log-start' && socket.authed) {
+        startLogStream(msg.logType || 'agent', msg.level || '', socket);
+      }
+      if (msg.type === 'log-stop' && socket.authed) {
+        stopLogStream();
       }
     } catch {}
   });
