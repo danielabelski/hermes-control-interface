@@ -1723,16 +1723,21 @@ app.get('/api/memory/:profile', requireAuth, async (req, res) => {
   try {
     const profile = req.params.profile;
     const home = profile === 'default' ? `${process.env.HOME}/.hermes` : `${process.env.HOME}/.hermes/profiles/${profile}`;
-    const [memoryContent, userContent] = await Promise.all([
-      shell(`cat "${home}/MEMORY.md" 2>/dev/null || echo ""`),
-      shell(`cat "${home}/USER.md" 2>/dev/null || echo ""`),
+    const memoriesDir = profile === 'default' ? `${process.env.HOME}/.hermes/memories` : `${home}/memories`;
+    const [memoryContent, userContent, soulContent] = await Promise.all([
+      shell(`cat "${memoriesDir}/MEMORY.md" 2>/dev/null || echo ""`),
+      shell(`cat "${memoriesDir}/USER.md" 2>/dev/null || echo ""`),
+      shell(`cat "${home}/SOUL.md" 2>/dev/null || echo ""`),
     ]);
     res.json({
       ok: true,
       memory_chars: memoryContent.length,
+      memory_max: 2200,
       user_chars: userContent.length,
-      memory_content: memoryContent.substring(0, 500),
-      user_content: userContent.substring(0, 500),
+      user_max: 1375,
+      soul_chars: soulContent.length,
+      memory_content: memoryContent.substring(0, 200),
+      user_content: userContent.substring(0, 200),
     });
   } catch (e) {
     res.json({ ok: false, error: e.message });
@@ -1802,6 +1807,72 @@ app.delete('/api/sessions/:id', requireCsrf, async (req, res) => {
   try {
     const output = await shell(`hermes sessions delete ${req.params.id} 2>&1`);
     audit(req.hciUser?.username || 'unknown', req.hciUser?.role || 'unknown', 'SESSION_DELETE', req.params.id);
+    res.json({ ok: true, output });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// Session stats
+app.get('/api/sessions/stats', requireAuth, async (req, res) => {
+  try {
+    const output = await shell('hermes sessions stats 2>&1');
+    res.json({ ok: true, stats: output });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// Token usage / insights
+app.get('/api/usage/:days', requireAuth, async (req, res) => {
+  try {
+    const days = Math.min(parseInt(req.params.days || '7', 10), 90);
+    const output = await shell(`hermes insights --days ${days} 2>&1`);
+    res.json({ ok: true, output });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// Create agent (profile)
+app.post('/api/profiles/create', requireRole('admin'), async (req, res) => {
+  try {
+    const { name, cloneFrom } = req.body || {};
+    if (!name) return res.status(400).json({ ok: false, error: 'Profile name required' });
+    const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '');
+    const cloneArg = cloneFrom ? `--clone-from ${cloneFrom}` : '';
+    const output = await shell(`hermes profile create ${safeName} ${cloneArg} 2>&1`);
+    audit(req.hciUser?.username || 'unknown', req.hciUser?.role || 'unknown', 'PROFILE_CREATE', safeName);
+    addNotification('success', `Profile created: ${safeName}`);
+    // Invalidate cache
+    getProfiles.cache = { at: 0, data: [] };
+    res.json({ ok: true, output });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// Delete agent (profile)
+app.delete('/api/profiles/:name', requireRole('admin'), async (req, res) => {
+  try {
+    const name = req.params.name;
+    if (name === 'default') return res.status(400).json({ ok: false, error: 'Cannot delete default profile' });
+    const output = await shell(`hermes profile delete ${name} -y 2>&1`);
+    audit(req.hciUser?.username || 'unknown', req.hciUser?.role || 'unknown', 'PROFILE_DELETE', name);
+    addNotification('info', `Profile deleted: ${name}`);
+    getProfiles.cache = { at: 0, data: [] };
+    res.json({ ok: true, output });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// Agent insights (per profile)
+app.get('/api/insights/:profile/:days', requireAuth, async (req, res) => {
+  try {
+    const profile = req.params.profile;
+    const days = Math.min(parseInt(req.params.days || '7', 10), 90);
+    const output = await shell(`hermes --profile ${profile} insights --days ${days} 2>&1`);
     res.json({ ok: true, output });
   } catch (e) {
     res.json({ ok: false, error: e.message });

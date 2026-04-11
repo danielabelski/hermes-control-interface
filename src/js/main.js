@@ -287,9 +287,11 @@ async function loadHome(container) {
         </div>
         <div class="card">
           <div class="card-title">Token Usage (7d)</div>
-          <div class="loading">Coming soon</div>
+          <div id="home-token-usage"><div class="loading">Loading...</div></div>
         </div>
       `;
+      // Fetch token usage
+      loadTokenUsage('home-token-usage', 7);
     } else {
       quickEl.innerHTML = `
         <div class="card">
@@ -298,12 +300,28 @@ async function loadHome(container) {
         </div>
         <div class="card">
           <div class="card-title">Token Usage (7d)</div>
-          <div class="loading">Coming soon</div>
+          <div id="home-token-usage-2"><div class="loading">Loading...</div></div>
         </div>
       `;
+      loadTokenUsage('home-token-usage-2', 7);
     }
   } catch (e) {
     document.getElementById('home-cards').innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+  }
+}
+
+async function loadTokenUsage(elementId, days = 7) {
+  const el = document.getElementById(elementId);
+  if (!el) return;
+  try {
+    const res = await api(`/api/usage/${days}`);
+    if (res.ok && res.output) {
+      el.innerHTML = `<pre style="font-size:10px;white-space:pre-wrap;color:var(--fg-muted);margin:0;max-height:150px;overflow-y:auto;">${escapeHtml(res.output)}</pre>`;
+    } else {
+      el.innerHTML = '<div class="stat-row"><span class="stat-label">No data</span></div>';
+    }
+  } catch {
+    el.innerHTML = '<div class="stat-row"><span class="stat-label">Unavailable</span></div>';
   }
 }
 
@@ -314,7 +332,10 @@ async function loadAgents(container) {
         <div class="page-title">Agents</div>
         <div class="page-subtitle">Manage your Hermes profiles</div>
       </div>
-      <button class="btn btn-ghost" onclick="loadAgents(document.querySelector('.page.active'))">↻ Refresh</button>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-primary" onclick="showCreateAgent()">+ Create Agent</button>
+        <button class="btn btn-ghost" onclick="loadAgents(document.querySelector('.page.active'))">↻ Refresh</button>
+      </div>
     </div>
     <div class="card-grid" id="agents-grid">
       <div class="loading">Loading agents</div>
@@ -445,10 +466,11 @@ async function loadAgentDashboard(container, name) {
         </div>
         <div class="card">
           <div class="card-title">Token Usage (today)</div>
-          <div class="loading">Coming soon</div>
+          <div id="agent-token-${name}"><div class="loading">Loading...</div></div>
         </div>
       </div>
     `;
+    loadTokenUsage(`agent-token-${name}`, 1);
   } catch (e) {
     container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
   }
@@ -865,13 +887,14 @@ async function loadAgentMemory(container, name) {
       <div class="card-grid">
         <div class="card">
           <div class="card-title">Built-in Memory</div>
-          <div class="stat-row"><span class="stat-label">MEMORY.md</span><span class="stat-value">${memory.memory_chars || 0} / 2200 chars</span></div>
+          <div class="stat-row"><span class="stat-label">MEMORY.md</span><span class="stat-value">${memory.memory_chars || 0} / ${memory.memory_max || 2200} chars</span></div>
           <div style="margin-top:8px;">
-            <div style="background:var(--bg-panel);border-radius:4px;height:8px;overflow:hidden;">
-              <div style="width:${Math.min(100, ((memory.memory_chars || 0) / 2200) * 100)}%;height:100%;background:${((memory.memory_chars || 0) / 2200) > 0.9 ? 'var(--red)' : 'var(--green)'};border-radius:4px;transition:width 0.3s;"></div>
+            <div class="progress-bar">
+              <div class="progress-fill ${((memory.memory_chars || 0) / (memory.memory_max || 2200)) > 0.9 ? 'red' : 'green'}" style="width:${Math.min(100, ((memory.memory_chars || 0) / (memory.memory_max || 2200)) * 100)}%;"></div>
             </div>
           </div>
-          <div class="stat-row" style="margin-top:8px;"><span class="stat-label">USER.md</span><span class="stat-value">${memory.user_chars || 0} chars</span></div>
+          <div class="stat-row" style="margin-top:8px;"><span class="stat-label">USER.md</span><span class="stat-value">${memory.user_chars || 0} / ${memory.user_max || 1375} chars</span></div>
+          <div class="stat-row"><span class="stat-label">SOUL.md</span><span class="stat-value">${memory.soul_chars || 0} chars</span></div>
         </div>
         ${providerSection}
       </div>
@@ -953,14 +976,14 @@ async function loadMonitor(container) {
       </div>
       <div class="card">
         <div class="card-title">Token Usage (30d)</div>
-        <div class="stat-row"><span class="stat-label">Tokens</span><span class="stat-value">${healthRes.tokens_30d || '—'}</span></div>
-        <div class="stat-row"><span class="stat-label">Cost</span><span class="stat-value">${healthRes.cost_30d || '—'}</span></div>
+        <div id="monitor-token-usage"><div class="loading">Loading...</div></div>
       </div>
       <div class="card">
         <div class="card-title">Errors</div>
         <div class="stat-row"><span class="stat-label">Error count</span><span class="stat-value ${healthRes.error_count > 0 ? '' : 'status-ok'}">${healthRes.error_count || 0}</span></div>
       </div>
     `;
+    loadTokenUsage('monitor-token-usage', 30);
 
   } catch (e) {
     document.getElementById('monitor-resources').innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
@@ -1213,6 +1236,33 @@ async function runUpdate() {
     showToast('Hermes update started', 'success');
   } catch (e) {
     el.innerHTML = `<div class="error-msg">${e.message}</div>`;
+  }
+}
+
+async function showCreateAgent() {
+  const name = await customPrompt('Agent name (lowercase, no spaces):');
+  if (!name) return;
+  const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
+  if (!safeName) {
+    await customAlert('Invalid name. Use letters, numbers, hyphens, underscores.', 'Error');
+    return;
+  }
+  const cloneFrom = await customPrompt('Clone from profile? (leave empty for fresh):', '');
+  try {
+    const csrfToken = state.csrfToken || '';
+    const res = await api('/api/profiles/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+      body: JSON.stringify({ name: safeName, cloneFrom: cloneFrom || undefined }),
+    });
+    if (res.ok) {
+      showToast(`Agent ${safeName} created!`, 'success');
+      loadAgents(document.querySelector('.page.active'));
+    } else {
+      await customAlert(res.error || 'Failed to create agent', 'Error');
+    }
+  } catch (e) {
+    await customAlert(e.message, 'Error');
   }
 }
 
@@ -1521,6 +1571,7 @@ Object.assign(window, {
   runDoctor,
   runDump,
   runUpdate,
+  showCreateAgent,
   showCreateUser,
   createUser,
   loadUsers,
