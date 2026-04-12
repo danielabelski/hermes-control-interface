@@ -2000,6 +2000,16 @@ function parseInsights(raw) {
         return { name: parts[0]?.trim() || '', calls: parts[1]?.trim() || '', pct: parts[2]?.trim() || '' };
       });
     }
+
+    // Platforms
+    const platSection = raw.match(/📱 Platforms[\s\S]*?──+\n([\s\S]*?)(?=\n\s*🔧|\n\s*📅|\n\s*🏆|$)/);
+    if (platSection) {
+      const lines = platSection[1].trim().split('\n').filter(l => l.trim() && !l.includes('Platform'));
+      data.platforms = lines.map(l => {
+        const parts = l.trim().split(/\s{2,}/);
+        return { name: parts[0]?.trim() || '', sessions: parts[1]?.trim() || '', messages: parts[2]?.trim() || '', tokens: parts[3]?.trim() || '' };
+      });
+    }
   } catch {}
   return data;
 }

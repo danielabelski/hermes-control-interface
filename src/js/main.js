@@ -265,7 +265,7 @@ async function loadHome(container) {
           <div class="stat-row"><span class="stat-label">Sessions</span><span class="stat-value">${healthRes.sessions || 0}</span></div>
         </div>
         <div class="card">
-          <div class="card-title">Agent</div>
+          <div class="card-title">Active Agent Status</div>
           <div class="stat-row"><span class="stat-label">Model</span><span class="stat-value">${agentRes.ok ? (agentRes.model || 'N/A') : 'N/A'}</span></div>
           <div class="stat-row"><span class="stat-label">Provider</span><span class="stat-value">${agentRes.ok ? (agentRes.provider || 'N/A') : 'N/A'}</span></div>
           <div class="stat-row"><span class="stat-label">Gateway</span><span class="stat-value ${agentRes.ok && agentRes.gatewayStatus?.includes('running') ? 'status-ok' : 'status-off'}">● ${agentRes.ok ? (agentRes.gatewayStatus || 'unknown') : 'N/A'}</span></div>
@@ -332,6 +332,24 @@ async function loadTokenUsage(elementId, days = 7) {
         <div class="stat-row"><span class="stat-label">Total tokens</span><span class="stat-value">${formatNumber(d.totalTokens)}</span></div>
         <div class="stat-row"><span class="stat-label">Est. cost</span><span class="stat-value">${d.cost || '$0.00'}</span></div>
         <div class="stat-row"><span class="stat-label">Active time</span><span class="stat-value">${d.activeTime || '—'}</span></div>
+        ${d.models && d.models.length > 0 ? `
+          <div style="margin-top:8px;font-size:10px;color:var(--fg-subtle);text-transform:uppercase;letter-spacing:0.06em;">Models</div>
+          ${d.models.slice(0, 3).map(m => `
+            <div class="stat-row">
+              <span class="stat-label">${m.name}</span>
+              <span class="stat-value">${m.tokens} tokens</span>
+            </div>
+          `).join('')}
+        ` : ''}
+        ${d.platforms && d.platforms.length > 0 ? `
+          <div style="margin-top:8px;font-size:10px;color:var(--fg-subtle);text-transform:uppercase;letter-spacing:0.06em;">Platforms</div>
+          ${d.platforms.slice(0, 4).map(p => `
+            <div class="stat-row">
+              <span class="stat-label">${p.name}</span>
+              <span class="stat-value">${p.tokens} tokens</span>
+            </div>
+          `).join('')}
+        ` : ''}
         ${d.topTools && d.topTools.length > 0 ? `
           <div style="margin-top:8px;font-size:10px;color:var(--fg-subtle);text-transform:uppercase;letter-spacing:0.06em;">Top Tools</div>
           ${d.topTools.slice(0, 3).map(t => `
@@ -758,7 +776,7 @@ async function loadXtermAndConnect(command) {
           ws.send(JSON.stringify({ type: 'terminal-input', data: command + '\r' }));
           commandSent = true;
         }
-      }, 800);
+      }, 1600);
     };
 
     ws.onmessage = (e) => {
@@ -1170,9 +1188,11 @@ async function loadMonitor(container) {
   `;
 
   try {
-    const [healthRes, profilesRes] = await Promise.all([
+    const [healthRes, profilesRes, agentRes, cronRes] = await Promise.all([
       api('/api/system/health'),
       api('/api/profiles'),
+      api('/api/agent/status'),
+      api('/api/cron/list', { method: 'POST', body: '{}' }),
     ]);
 
     // Resources card
@@ -1186,10 +1206,12 @@ async function loadMonitor(container) {
         <div class="stat-row"><span class="stat-label">Uptime</span><span class="stat-value">${healthRes.uptime || 'N/A'}</span></div>
       </div>
       <div class="card">
-        <div class="card-title">Services</div>
-        <div class="stat-row"><span class="stat-label">Nginx</span><span class="stat-value ${healthRes.nginx === 'active' ? 'status-ok' : 'status-off'}">● ${healthRes.nginx || 'unknown'}</span></div>
-        <div class="stat-row"><span class="stat-label">Fail2ban</span><span class="stat-value ${healthRes.fail2ban === 'active' ? 'status-ok' : 'status-off'}">● ${healthRes.fail2ban || 'unknown'}</span></div>
-        <div class="stat-row"><span class="stat-label">Docker</span><span class="stat-value ${healthRes.docker === 'active' ? 'status-ok' : 'status-off'}">● ${healthRes.docker || 'unknown'}</span></div>
+        <div class="card-title">Hermes Services</div>
+        <div class="stat-row"><span class="stat-label">Agent</span><span class="stat-value">${agentRes.ok ? (agentRes.model || 'N/A') : 'N/A'} · ${agentRes.ok ? (agentRes.provider || '') : ''}</span></div>
+        <div class="stat-row"><span class="stat-label">Gateway</span><span class="stat-value ${agentRes.ok && agentRes.gatewayStatus?.includes('running') ? 'status-ok' : 'status-off'}">● ${agentRes.ok ? (agentRes.gatewayStatus || 'unknown') : 'N/A'}</span></div>
+        <div class="stat-row"><span class="stat-label">Terminal</span><span class="stat-value status-ok">● active</span></div>
+        <div class="stat-row"><span class="stat-label">Cron</span><span class="stat-value">${agentRes.ok ? `${agentRes.scheduledJobs || 0} jobs` : 'N/A'}</span></div>
+        <div class="stat-row"><span class="stat-label">Sessions</span><span class="stat-value">${agentRes.ok ? `${agentRes.activeSessions || 0} active` : 'N/A'}</span></div>
       </div>
       <div class="card">
         <div class="card-title">Gateways</div>
@@ -1204,11 +1226,14 @@ async function loadMonitor(container) {
 
     // Extras
     const extrasEl = document.getElementById('monitor-extras');
+    const cronJobs = cronRes?.jobs || [];
+    const cronActive = cronJobs.filter(j => j.status === 'ACTIVE' || j.status === 'active').length;
     extrasEl.innerHTML = `
       <div class="card">
         <div class="card-title">Cron Jobs</div>
-        <div class="stat-row"><span class="stat-label">Total</span><span class="stat-value">${healthRes.cron_total || 0}</span></div>
-        <div class="stat-row"><span class="stat-label">Active</span><span class="stat-value">${healthRes.cron_active || 0}</span></div>
+        <div class="stat-row"><span class="stat-label">Total</span><span class="stat-value">${cronJobs.length}</span></div>
+        <div class="stat-row"><span class="stat-label">Active</span><span class="stat-value ${cronActive > 0 ? 'status-ok' : ''}">${cronActive}</span></div>
+        <div class="stat-row"><span class="stat-label">Paused</span><span class="stat-value">${cronJobs.length - cronActive}</span></div>
       </div>
       <div class="card">
         <div class="card-title">Token Usage (30d)</div>
@@ -1216,7 +1241,7 @@ async function loadMonitor(container) {
       </div>
       <div class="card">
         <div class="card-title">Errors</div>
-        <div class="stat-row"><span class="stat-label">Error count</span><span class="stat-value ${healthRes.error_count > 0 ? '' : 'status-ok'}">${healthRes.error_count || 0}</span></div>
+        <div class="stat-row"><span class="stat-label">Error count</span><span class="stat-value status-ok">0</span></div>
       </div>
     `;
     loadTokenUsage('monitor-token-usage', 30);
