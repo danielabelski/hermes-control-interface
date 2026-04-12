@@ -1565,7 +1565,7 @@ app.post('/api/file', requireCsrf, (req, res) => {
 
 // File listing API for File Explorer
 app.get('/api/files/list', requireAuth, (req, res) => {
-  const dirPath = String(req.query.path || '').replace(/^\/+/, '');
+  const dirPath = String(req.query.path || '').replace(/^\/+/, '').replace(/\.\./g, '');
   const baseDir = path.join(os.homedir(), '.hermes');
   
   // Security: ensure we stay within .hermes
@@ -1611,7 +1611,7 @@ app.get('/api/files/list', requireAuth, (req, res) => {
       ok: true,
       path: path.relative(baseDir, resolved),
       items,
-      parent: path.relative(baseDir, path.dirname(resolved))
+      parent: path.relative(baseDir, path.dirname(resolved)).replace(/\.\./g, '') || ''
     });
   } catch (error) {
     res.status(500).json({ error: error.message || 'failed to list directory' });

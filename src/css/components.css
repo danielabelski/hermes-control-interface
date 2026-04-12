@@ -168,6 +168,31 @@
   border-color: var(--border-strong);
 }
 
+/* Themed select */
+.log-level-select {
+  padding: 6px 28px 6px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 11px;
+  outline: none;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2384887c'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  transition: border-color var(--transition);
+}
+.log-level-select:hover {
+  border-color: var(--border-strong);
+}
+.log-level-select:focus {
+  border-color: var(--accent);
+}
+
 /* Search input */
 .search-input {
   padding: 8px 12px;
