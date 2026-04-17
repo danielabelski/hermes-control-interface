@@ -3104,31 +3104,31 @@ app.post('/api/update', requireRole('admin'), (req, res) => {
   res.write(`data: ${JSON.stringify({ type: 'progress', line: 'Starting Hermes update...' })}\n\n`);
   audit(req.hciUser?.username || 'unknown', req.hciUser?.role || 'unknown', 'HERMES_UPDATE', 'started');
 
-  const proc = spawn('script', ['-qfc', 'hermes update --gateway', '/dev/null'], {
+  // Use expect to auto-answer prompts + get line-buffered PTY output
+  const expectScript = [
+    'set timeout 300',
+    'spawn hermes update --gateway',
+    'expect {',
+    '  -re {\\[Y/n\\]|\\[y/N\\]|\\[y/n\\]|\\(y/n\\)|\\(Y/n\\)} { send "Y\\r"; exp_continue }',
+    '  eof',
+    '}',
+  ].join('\n');
+  const proc = spawn('expect', ['-c', expectScript], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, HERMES_HOME: path.join(os.homedir(), '.hermes'), TERM: 'dumb' },
   });
-  // Auto-answer any [Y/n] prompts — watch output for prompts, respond with 'Y\r' (PTY Enter)
   let fullOutput = '';
-  const answerPrompt = () => { try { proc.stdin.write('Y\r'); } catch {} };
   proc.stdout.on('data', (chunk) => {
     const text = stripAnsi(chunk.toString());
     fullOutput += text;
     text.split('\n').filter(l => l.trim()).forEach(line => {
       res.write(`data: ${JSON.stringify({ type: 'progress', line: line.trim() })}\n\n`);
     });
-    // Detect prompt and answer immediately
-    if (text.includes('[Y/n]') || text.includes('[y/N]') || text.includes('[y/n]') || text.includes('(y/n)') || text.includes('(Y/n)')) {
-      setTimeout(answerPrompt, 300);
-    }
   });
   proc.stderr.on('data', (chunk) => {
     const text = stripAnsi(chunk.toString());
     fullOutput += text;
     if (text.trim()) res.write(`data: ${JSON.stringify({ type: 'progress', line: text.trim() })}\n\n`);
-    if (text.includes('[Y/n]') || text.includes('[y/N]') || text.includes('[y/n]') || text.includes('(y/n)') || text.includes('(Y/n)')) {
-      setTimeout(answerPrompt, 300);
-    }
   });
   proc.on('close', (code) => {
     res.write(`data: ${JSON.stringify({ type: 'done', output: fullOutput.trim() })}\n\n`);
