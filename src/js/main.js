@@ -3,6 +3,7 @@
    ============================================ */
 import { Chart, registerables } from 'chart.js';
 import { toDisplayText } from './chat-render-utils.mjs';
+import { resolveSessionDisplayTitle } from './session-title-utils.mjs';
 Chart.register(...registerables);
 
 // State
@@ -426,7 +427,9 @@ async function loadChatSession(sessionId) {
     const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages?profile=${encodeURIComponent(profile)}`, { credentials: 'include' });
     if (!r.ok) { container.innerHTML = '<div class="error-msg">Failed to load messages</div>'; return; }
     const data = await r.json();
-    if (titleEl) titleEl.textContent = toDisplayText(data.title ?? ('Session ' + sessionId));
+    if (titleEl) {
+      titleEl.textContent = toDisplayText(resolveSessionDisplayTitle({ sessionId, data }));
+    }
     if (subtitleEl) subtitleEl.textContent = `${data.messages?.length || 0} messages · ${profile}`;
 
     // Token info
