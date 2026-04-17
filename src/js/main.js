@@ -883,6 +883,7 @@ async function hciupdate() {
 }
 
 async function hcidoctor() {
+  if (!await customConfirm('Run health check? This will test all API endpoints.', 'Health Check')) return;
   try {
     showToast('Running health check...', 'info');
     const res = await api('/api/doctor', { method: 'POST', headers: { 'X-CSRF-Token': state.csrfToken || '' } });
@@ -1041,6 +1042,7 @@ async function deleteAgent(name) {
 }
 
 async function setAgentDefault(name) {
+  if (!await customConfirm(`Set "${name}" as default profile?`, 'Set Default')) return;
   try {
     const csrfToken = state.csrfToken || '';
     await api('/api/profiles/use', {
@@ -1220,6 +1222,7 @@ window.loadAgentSkills = async function(container, name) {
 }
 
 window.updateSkill = async function(skillName, profile) {
+  if (!await customConfirm(`Update skill "${skillName}" on ${profile}?`, 'Update Skill')) return;
   try {
     const res = await api('/api/skills/update', { method: 'POST', body: JSON.stringify({ skill: skillName, profile }) });
     showToast(res.ok ? 'Skill updated!' : (res.output || 'Update failed'), res.ok ? 'success' : 'error');
@@ -1716,6 +1719,7 @@ async function renameSession(sessionId, profileName) {
 }
 
 async function exportSession(sessionId) {
+  if (!await customConfirm(`Export session ${sessionId} as JSON?`, 'Export Session')) return;
   try {
     const res = await api(`/api/sessions/${sessionId}/export`);
     if (res.ok) {
@@ -1830,7 +1834,8 @@ async function loadGatewayLogs(name) {
 }
 
 async function gatewayAction(profile, action) {
-  if (action === 'stop' && !await customConfirm(`Stop gateway for ${profile}?`)) return;
+  const messages = { start: `Start gateway for ${profile}?`, stop: `Stop gateway for ${profile}?`, restart: `Restart gateway for ${profile}? This may interrupt active sessions.` };
+  if (!await customConfirm(messages[action] || `${action} gateway for ${profile}?`, action.charAt(0).toUpperCase() + action.slice(1) + ' Gateway')) return;
   try {
     const csrfToken = state.csrfToken || '';
     const res = await api(`/api/gateway/${profile}/${action}`, {
@@ -2130,6 +2135,8 @@ async function loadCronJobs(profile) {
 }
 
 async function cronAction(profile, jobId, action) {
+  const labels = { run: 'Run', pause: 'Pause', resume: 'Resume' };
+  if (!await customConfirm(`${labels[action] || action} cron job on ${profile}?`, (labels[action] || action) + ' Job')) return;
   try {
     await api('/api/hermes-cron/' + encodeURIComponent(profile) + '/' + jobId + '/' + action, { method: 'POST', headers: { 'X-CSRF-Token': state.csrfToken || '' } });
     showToast('Job ' + action + 'd', 'success');
@@ -3015,6 +3022,7 @@ async function deleteUser(username) {
 }
 
 async function createBackup() {
+  if (!await customConfirm('Create a system backup? This may take a moment.', 'Create Backup')) return;
   try {
     showToast('Creating backup...', 'info');
     const csrfToken = state.csrfToken || '';
@@ -3037,7 +3045,7 @@ async function importBackup(input) {
   if (!input.files?.[0]) return;
   const file = input.files[0];
   if (!file.name.endsWith('.zip')) return showToast('Please select a .zip file', 'error');
-  if (!confirm('Import backup? This will restore data from the backup file.')) { input.value = ''; return; }
+  if (!await customConfirm('Import backup? This will restore data from the backup file.', 'Import Backup')) { input.value = ''; return; }
   try {
     showToast('Importing backup...', 'info');
     const csrfToken = state.csrfToken || '';
@@ -3188,6 +3196,7 @@ function renderDoctorOutput(raw) {
 }
 
 async function runHealthCheck() {
+  if (!await customConfirm('Run health check on all API endpoints?', 'Health Check')) return;
   const el = document.getElementById('health-check-results');
   if (!el) return;
   el.innerHTML = '<div class="loading">Testing APIs...</div>';
@@ -3219,6 +3228,8 @@ async function runHealthCheck() {
 }
 
 async function runDoctor(fix = false) {
+  const msg = fix ? 'Run diagnostics with auto-fix? This may modify system settings.' : 'Run diagnostics? This is read-only.';
+  if (!await customConfirm(msg, fix ? 'Auto-fix' : 'Diagnostics')) return;
   const el = document.getElementById('doctor-result');
   el.innerHTML = '<div class="loading">Running diagnostics...</div>';
   try {
@@ -3239,6 +3250,7 @@ async function runDoctor(fix = false) {
 }
 
 async function runDump() {
+  if (!await customConfirm('Generate system dump? This creates a summary of current configuration.', 'Generate Dump')) return;
   const el = document.getElementById('dump-result');
   el.innerHTML = '<div class="loading">Generating dump...</div>';
   try {
