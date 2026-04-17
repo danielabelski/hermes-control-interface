@@ -2452,7 +2452,11 @@ app.post('/api/hci/update', requireRole('admin'), (req, res) => {
     res.write(`data: ${JSON.stringify({ type: 'progress', line: '▸ Update complete. Restarting in 3s...' })}\n\n`);
     res.write(`data: ${JSON.stringify({ type: 'done', message: 'Update complete, restarting...' })}\n\n`);
     res.end();
-    setTimeout(() => { process.exit(0); }, 3000);
+    // Spawn restart script — same pattern as /api/hci-restart
+    // Server stays alive until fuser -k kills it, then new one starts
+    const restartScript = `sleep 3 && fuser -k ${PORT}/tcp 2>/dev/null; sleep 1 && cd ${PROJECT_ROOT} && nohup node server.js &>/dev/null &`;
+    spawn('sh', ['-c', restartScript], { detached: true, stdio: 'ignore' }).unref();
+    // No process.exit(0) — fuser -k will kill us cleanly
   })();
 });
 
