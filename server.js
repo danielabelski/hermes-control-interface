@@ -2938,30 +2938,43 @@ app.post('/api/doctor', requireRole('admin'), async (req, res) => {
 });
 
 // ── Backup & Import ──
+// Helper: strip ANSI escape codes from string
+function stripAnsi(str) {
+  return str.replace(/\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\r/g, '');
+}
+
 app.post('/api/backup/create', requireRole('admin'), (req, res) => {
-  // SSE response — stream hermes backup progress
+  // SSE response — stream hermes backup progress in real-time
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',  // prevent nginx buffering
   });
+  res.flushHeaders();
+  // Send initial event so frontend knows connection is alive
+  res.write(`data: ${JSON.stringify({ type: 'progress', line: 'Starting backup...' })}\n\n`);
+
   const outPath = `/tmp/hermes-backup-${Date.now()}.zip`;
-  const proc = spawn('bash', ['-lc', `hermes backup -o ${outPath} 2>&1`], {
+  // Use 'script' to fake a PTY — forces hermes CLI to line-buffer stdout
+  const proc = spawn('script', ['-qfc', `hermes backup -o ${outPath}`, '/dev/null'], {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, HERMES_HOME: path.join(os.homedir(), '.hermes') },
+    env: { ...process.env, HERMES_HOME: path.join(os.homedir(), '.hermes'), TERM: 'dumb' },
   });
   let fullOutput = '';
   proc.stdout.on('data', (chunk) => {
-    const text = chunk.toString();
+    const text = stripAnsi(chunk.toString());
     fullOutput += text;
-    text.split('\n').filter(Boolean).forEach(line => {
-      res.write(`data: ${JSON.stringify({ type: 'progress', line })}\n\n`);
+    text.split('\n').filter(l => l.trim()).forEach(line => {
+      res.write(`data: ${JSON.stringify({ type: 'progress', line: line.trim() })}\n\n`);
     });
   });
   proc.stderr.on('data', (chunk) => {
-    const text = chunk.toString();
+    const text = stripAnsi(chunk.toString());
     fullOutput += text;
-    res.write(`data: ${JSON.stringify({ type: 'progress', line: text.trim() })}\n\n`);
+    if (text.trim()) {
+      res.write(`data: ${JSON.stringify({ type: 'progress', line: text.trim() })}\n\n`);
+    }
   });
   proc.on('close', (code) => {
     if (!fs.existsSync(outPath)) {
@@ -2983,28 +2996,36 @@ app.post('/api/backup/import', requireRole('admin'), (req, res) => {
       return res.json({ ok: false, error: multerErr?.message || 'No file uploaded' });
     }
     const zipPath = req.file.path;
-    // SSE response — stream hermes import progress
+    // SSE response — stream hermes import progress in real-time
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
     });
-    const proc = spawn('bash', ['-lc', `hermes import ${zipPath} --force 2>&1`], {
+    res.flushHeaders();
+    res.write(`data: ${JSON.stringify({ type: 'progress', line: `File uploaded: ${req.file.originalname} (${(req.file.size / 1024 / 1024).toFixed(1)} MB)` })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'progress', line: 'Starting import...' })}\n\n`);
+
+    // Use 'script' to fake a PTY — forces hermes CLI to line-buffer stdout
+    const proc = spawn('script', ['-qfc', `hermes import ${zipPath} --force`, '/dev/null'], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, HERMES_HOME: path.join(os.homedir(), '.hermes') },
+      env: { ...process.env, HERMES_HOME: path.join(os.homedir(), '.hermes'), TERM: 'dumb' },
     });
     let fullOutput = '';
     proc.stdout.on('data', (chunk) => {
-      const text = chunk.toString();
+      const text = stripAnsi(chunk.toString());
       fullOutput += text;
-      text.split('\n').filter(Boolean).forEach(line => {
-        res.write(`data: ${JSON.stringify({ type: 'progress', line })}\n\n`);
+      text.split('\n').filter(l => l.trim()).forEach(line => {
+        res.write(`data: ${JSON.stringify({ type: 'progress', line: line.trim() })}\n\n`);
       });
     });
     proc.stderr.on('data', (chunk) => {
-      const text = chunk.toString();
+      const text = stripAnsi(chunk.toString());
       fullOutput += text;
-      res.write(`data: ${JSON.stringify({ type: 'progress', line: text.trim() })}\n\n`);
+      if (text.trim()) {
+        res.write(`data: ${JSON.stringify({ type: 'progress', line: text.trim() })}\n\n`);
+      }
     });
     proc.on('close', (code) => {
       try { fs.unlinkSync(zipPath); } catch {}
