@@ -2979,6 +2979,7 @@ async function loadUsers() {
   try {
     const res = await api('/api/users');
     const el = document.getElementById('users-list');
+    if (!el) return; // Users page might be active, no maintenance panel
     if (res.ok && res.users) {
       el.innerHTML = res.users.map(u => {
         const canManage = hasPerm('users.manage');
@@ -2996,8 +2997,14 @@ async function loadUsers() {
       el.innerHTML = '<div class="stat-row"><span class="stat-label">No users</span></div>';
     }
   } catch (e) {
-    document.getElementById('users-list').innerHTML = `<div class="error-msg">${e.message}</div>`;
+    const el = document.getElementById('users-list');
+    if (el) el.innerHTML = `<div class="error-msg">${e.message}</div>`;
   }
+}
+
+function refreshUsersEverywhere() {
+  loadUsers();
+  if (state.page === 'users') loadUsersPage(document.getElementById('page-users'));
 }
 
 async function deleteUser(username) {
@@ -3010,7 +3017,7 @@ async function deleteUser(username) {
     });
     if (res.ok) {
       showToast(`User ${username} deleted`, 'success');
-      loadUsers();
+      refreshUsersEverywhere();
     } else {
       await customAlert(res.error || 'Failed', 'Error');
     }
@@ -3487,9 +3494,7 @@ async function createUser(username, password, role, permissions) {
     });
     if (res.ok) {
       showToast(`User ${username} created`, 'success');
-      // Refresh users list wherever it's visible
-      loadUsers();
-      if (state.page === 'users') loadUsersPage(document.getElementById('page-users'));
+      refreshUsersEverywhere();
     } else {
       showToast(`Failed: ${res.error}`, 'error');
     }
@@ -3615,7 +3620,7 @@ async function showEditUser(username) {
       if (res.ok) {
         showToast(`User ${username} updated`, 'success');
         overlay.remove();
-        loadUsers();
+        refreshUsersEverywhere();
       } else {
         showToast(`Failed: ${res.error}`, 'error');
       }
