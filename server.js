@@ -2722,6 +2722,28 @@ app.put('/api/config/:profile', requireAuth, requireRole('admin'), async (req, r
     const backupPath = `${configPath}.bak.${Date.now()}`;
     await shell(`cp "${configPath}" "${backupPath}" 2>/dev/null || true`);
 
+    // Auto-inject api_server for Gateway API chat (first-time config)
+    const existingCfg = fs.existsSync(configPath) ? yaml.load(fs.readFileSync(configPath, 'utf8')) || {} : {};
+    if (!existingCfg.platforms?.api_server?.enabled && !newConfig.platforms?.api_server?.enabled) {
+      const usedPorts = new Set(Object.values(discoverGatewayPorts()));
+      let port = 8650;
+      while (usedPorts.has(port)) port++;
+      newConfig.platforms = newConfig.platforms || {};
+      newConfig.platforms.api_server = {
+        enabled: true,
+        extra: {
+          host: '127.0.0.1',
+          port,
+          key: GATEWAY_API_KEY,
+          cors_origins: 'https://agent2.panji.me,https://agent.panji.me',
+        },
+      };
+      console.log(`[ConfigSave] Auto-injected api_server on port ${port} for ${profile}`);
+      // Start gateway service if not running
+      try { await shell(`systemctl restart hermes-gateway-${profile} 2>&1`, '15s'); } catch {}
+      gatewayPorts = discoverGatewayPorts();
+    }
+
     // Convert to YAML with good formatting
     const yaml = require('yaml');
     const doc = new yaml.Document(newConfig);
