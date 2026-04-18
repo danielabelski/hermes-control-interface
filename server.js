@@ -2632,6 +2632,187 @@ app.post('/api/hci/update', requireRole('admin'), (req, res) => {
   })();
 });
 
+// HCI Check Updates — git fetch + compare local vs remote
+app.get('/api/hci/check-update', requireRole('admin'), async (req, res) => {
+  try {
+    const HCI_DIR = __dirname;
+    // Get current branch
+    const branch = (await shell(`cd ${HCI_DIR} && git branch --show-current`, '5s')).trim();
+    // Fetch latest without modifying working tree
+    await shell(`cd ${HCI_DIR} && git fetch origin ${branch}`, '30s');
+    // Get local commit
+    const localHash = (await shell(`cd ${HCI_DIR} && git rev-parse --short HEAD`, '5s')).trim();
+    const localMsg = (await shell(`cd ${HCI_DIR} && git log -1 --pretty=format:"%s"`, '5s')).trim();
+    const localDate = (await shell(`cd ${HCI_DIR} && git log -1 --format="%ci"`, '5s')).trim();
+    // Get remote commit
+    const remoteHash = (await shell(`cd ${HCI_DIR} && git rev-parse --short origin/${branch}`, '5s')).trim();
+    // Count commits behind
+    const behindStr = (await shell(`cd ${HCI_DIR} && git rev-list HEAD..origin/${branch} --count`, '5s')).trim();
+    const behind = parseInt(behindStr, 10) || 0;
+    // List commits ahead on remote (newest first)
+    let commits = [];
+    if (behind > 0) {
+      const logRaw = await shell(
+        `cd ${HCI_DIR} && git log --oneline --format="%H|%h|%s|%an|%ci" HEAD..origin/${branch}`,
+        '10s'
+      );
+      commits = logRaw.trim().split('\n').filter(Boolean).map(line => {
+        const [hash, shortHash, msg, author, date] = line.split('|');
+        return { hash, shortHash, msg, author, date };
+      });
+    }
+    // Get package.json version
+    let pkgVersion = '';
+    try { pkgVersion = JSON.parse(fs.readFileSync(path.join(HCI_DIR, 'package.json'), 'utf8')).version; } catch {}
+
+    res.json({
+      ok: true,
+      branch,
+      local: { hash: localHash, msg: localMsg, date: localDate, version: pkgVersion },
+      remote: { hash: remoteHash },
+      behind,
+      commits,
+    });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// HCI Commit Diff — summary of changes for a specific commit
+app.get('/api/hci/commit/:hash/diff', requireRole('admin'), async (req, res) => {
+  try {
+    const HCI_DIR = __dirname;
+    const hash = req.params.hash.replace(/[^a-f0-9]/g, ''); // sanitize
+    // Get commit metadata
+    const metaRaw = await shell(
+      `cd ${HCI_DIR} && git log -1 --format="%H|%h|%s|%an|%ci|%b" ${hash}`, '5s'
+    );
+    const [fullHash, shortHash, msg, author, date, body] = metaRaw.trim().split('|');
+    // Get diffstat (summary only, no raw diff)
+    const stat = await shell(`cd ${HCI_DIR} && git diff --stat ${hash}~1..${hash} 2>&1`, '10s');
+    // Get numstat for structured data
+    const numstat = await shell(`cd ${HCI_DIR} && git diff --numstat ${hash}~1..${hash} 2>&1`, '10s');
+    const files = numstat.trim().split('\n').filter(Boolean).map(line => {
+      const parts = line.split('\t');
+      return { added: parseInt(parts[0], 10) || 0, removed: parseInt(parts[1], 10) || 0, file: parts[2] };
+    });
+    // Summary line from git diff --shortstat
+    const shortstat = (await shell(`cd ${HCI_DIR} && git diff --shortstat ${hash}~1..${hash}`, '5s')).trim();
+
+    res.json({
+      ok: true,
+      commit: { hash: fullHash, shortHash, msg, author, date, body: body || '' },
+      files,
+      shortstat,
+      statText: stat.trim(),
+    });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// HCI Update to specific commit — git checkout + npm install + build + auto-restart
+app.post('/api/hci/update/commit/:hash', requireRole('admin'), (req, res) => {
+  const HCI_DIR = __dirname;
+  const hash = req.params.hash.replace(/[^a-f0-9]/g, ''); // sanitize
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+  res.write(`data: ${JSON.stringify({ type: 'progress', line: `Checking out commit ${hash}...` })}\n\n`);
+
+  const steps = [
+    { name: 'fetch', cmd: `cd ${HCI_DIR} && git fetch origin`, timeout: '30s' },
+    { name: 'checkout', cmd: `cd ${HCI_DIR} && git checkout ${hash} 2>&1`, timeout: '15s' },
+    { name: 'npm install', cmd: `cd ${HCI_DIR} && npm install 2>&1`, timeout: '120s' },
+    { name: 'build', cmd: `cd ${HCI_DIR} && npm run build 2>&1`, timeout: '120s' },
+  ];
+
+  (async () => {
+    for (const step of steps) {
+      res.write(`data: ${JSON.stringify({ type: 'progress', line: `▸ ${step.name}...` })}\n\n`);
+      try {
+        const out = await shell(step.cmd, step.timeout || '60s');
+        const text = out.trim() || '(no output)';
+        text.split('\n').filter(l => l.trim()).forEach(line => {
+          res.write(`data: ${JSON.stringify({ type: 'progress', line: '  ' + line.trim() })}\n\n`);
+        });
+        if (out.includes('error') || out.includes('ERROR') || out.includes('fatal')) {
+          // Don't abort on git checkout "error" — it might be a warning
+          if (step.name === 'checkout') {
+            res.write(`data: ${JSON.stringify({ type: 'warning', line: 'Checkout had warnings but continuing' })}\n\n`);
+          } else {
+            res.write(`data: ${JSON.stringify({ type: 'error', message: `${step.name} failed` })}\n\n`);
+            return res.end();
+          }
+        }
+      } catch (e) {
+        res.write(`data: ${JSON.stringify({ type: 'error', message: `${step.name} failed: ${e.message}` })}\n\n`);
+        return res.end();
+      }
+    }
+    // Get commit info for confirmation
+    const currentHash = (await shell(`cd ${HCI_DIR} && git rev-parse --short HEAD`, '5s')).trim();
+    const currentMsg = (await shell(`cd ${HCI_DIR} && git log -1 --pretty=format:"%s"`, '5s')).trim();
+    res.write(`data: ${JSON.stringify({ type: 'progress', line: `▸ Now at ${currentHash}: ${currentMsg}` })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'progress', line: '▸ Update complete. Restarting in 3s...' })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'done', message: 'Update complete', hash: currentHash, msg: currentMsg })}\n\n`);
+    res.end();
+
+    // Spawn restart script (same pattern as existing /api/hci/update)
+    const restartScript = `sleep 3 && fuser -k ${PORT}/tcp 2>/dev/null; sleep 1 && cd ${PROJECT_ROOT} && nohup node server.js &>/tmp/hci-staging.log &`;
+    spawn('sh', ['-c', restartScript], { detached: true, stdio: 'ignore' }).unref();
+  })();
+});
+
+// HCI Rollback — checkout previous commit (HEAD~N)
+app.post('/api/hci/rollback', requireRole('admin'), (req, res) => {
+  const HCI_DIR = __dirname;
+  const steps = req.body?.steps || 1; // how many commits back, default 1
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+  res.write(`data: ${JSON.stringify({ type: 'progress', line: `Rolling back ${steps} commit(s)...` })}\n\n`);
+
+  const rollbackSteps = [
+    { name: 'checkout', cmd: `cd ${HCI_DIR} && git checkout HEAD~${steps} 2>&1`, timeout: '15s' },
+    { name: 'npm install', cmd: `cd ${HCI_DIR} && npm install 2>&1`, timeout: '120s' },
+    { name: 'build', cmd: `cd ${HCI_DIR} && npm run build 2>&1`, timeout: '120s' },
+  ];
+
+  (async () => {
+    for (const step of rollbackSteps) {
+      res.write(`data: ${JSON.stringify({ type: 'progress', line: `▸ ${step.name}...` })}\n\n`);
+      try {
+        const out = await shell(step.cmd, step.timeout);
+        const text = out.trim() || '(no output)';
+        text.split('\n').filter(l => l.trim()).forEach(line => {
+          res.write(`data: ${JSON.stringify({ type: 'progress', line: '  ' + line.trim() })}\n\n`);
+        });
+      } catch (e) {
+        res.write(`data: ${JSON.stringify({ type: 'error', message: `${step.name} failed: ${e.message}` })}\n\n`);
+        return res.end();
+      }
+    }
+    const currentHash = (await shell(`cd ${HCI_DIR} && git rev-parse --short HEAD`, '5s')).trim();
+    res.write(`data: ${JSON.stringify({ type: 'progress', line: `▸ Rolled back to ${currentHash}` })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'done', message: 'Rollback complete', hash: currentHash })}\n\n`);
+    res.end();
+
+    const restartScript = `sleep 3 && fuser -k ${PORT}/tcp 2>/dev/null; sleep 1 && cd ${PROJECT_ROOT} && nohup node server.js &>/tmp/hci-staging.log &`;
+    spawn('sh', ['-c', restartScript], { detached: true, stdio: 'ignore' }).unref();
+  })();
+});
+
 // ============================================
 // Missing API Endpoints
 // ============================================
