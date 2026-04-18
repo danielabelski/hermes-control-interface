@@ -477,7 +477,7 @@
   .topbar-nav.mobile-open { display: flex; }
   .nav-link { padding: 12px 16px; }
   .topbar-right { gap: 4px; }
-  #main { padding: 16px; }
+  #main { padding: 8px 16px 16px; }
   .notif-dropdown { right: 8px; left: 8px; width: auto; min-width: 0; }
   .modal-card { width: auto; margin: 16px; }
   .login-card { width: auto; margin: 16px; padding: 24px; }
@@ -486,6 +486,6 @@
 @media (max-width: 480px) {
   #topbar { padding: 0 10px; }
   .brand { font-size: 14px; }
-  #main { padding: 12px; }
+  #main { padding: 4px 12px 12px; }
   .user-role { display: none; }
 }

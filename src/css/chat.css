@@ -23,6 +23,7 @@
   overflow: hidden;
   flex-shrink: 0;
   height: 100%;
+  min-height: 100%;
 }
 
 .chat-sidebar.collapsed {
@@ -785,7 +786,7 @@
 
 @media (max-width: 768px) {
   .chat-layout {
-    margin: -12px;
+    margin: -8px -16px -16px;
     height: calc(100vh - 56px - 48px);
   }
 
