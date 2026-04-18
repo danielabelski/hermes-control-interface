@@ -697,12 +697,12 @@ function requireAuth(req, res, next) {
 function requireCsrf(req, res, next) {
   if (!isAuthed(req)) return res.status(401).json({ error: 'authentication required' });
   const headerToken = req.headers['x-csrf-token'];
-  if (!headerToken) { console.error('[CSRF-DEBUG] PUT cron/edit missing header token'); return res.status(403).json({ error: 'invalid CSRF token' }); }
+  if (!headerToken) return res.status(403).json({ error: 'invalid CSRF token' });
   const cookies = parseCookies(req);
   const authToken = cookies[AUTH_COOKIE];
-  if (!authToken) { console.error('[CSRF-DEBUG] PUT cron/edit missing auth cookie'); return res.status(403).json({ error: 'invalid CSRF token' }); }
+  if (!authToken) return res.status(403).json({ error: 'invalid CSRF token' });
   const expected = deriveCsrfToken(authToken);
-  if (!safeTimingEqual(headerToken, expected)) { console.error('[CSRF-DEBUG] PUT cron/edit token mismatch, got:', headerToken.substring(0,20), 'expected:', expected.substring(0,20)); return res.status(403).json({ error: 'invalid CSRF token' }); }
+  if (!safeTimingEqual(headerToken, expected)) return res.status(403).json({ error: 'invalid CSRF token' });
   return next();
 }
 
