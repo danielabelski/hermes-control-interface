@@ -2353,6 +2353,9 @@ async function loadAgentGateway(container, name) {
     const active = ok && res.active;
 
     container.innerHTML = `
+      <div id="gateway-health" style="margin-bottom:12px;">
+        <div class="loading">Checking gateway health...</div>
+      </div>
       <div class="card-grid">
         <div class="card">
           <div class="card-title">Gateway Service</div>
@@ -2376,11 +2379,93 @@ async function loadAgentGateway(container, name) {
 
     // Load connections
     loadGatewayConnections(name);
+    // Load health check
+    renderGatewayHealth(document.getElementById('gateway-health'), name);
 
   } catch (e) {
     container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
   }
 }
+
+async function renderGatewayHealth(container, profile) {
+  if (!container) return;
+  try {
+    const res = await api(`/api/gateway/${profile}/health`);
+    if (!res.ok) { container.innerHTML = '<div class="error-msg">Failed to check health</div>'; return; }
+
+    const statusIcon = res.healthy ? '🟢' : '🔴';
+    const statusText = res.healthy ? 'Healthy' : 'Issues Found';
+
+    let html = `<div class="gateway-health-card">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+        <span style="font-size:20px;">${statusIcon}</span>
+        <div>
+          <div style="font-weight:600;font-size:14px;">${statusText}</div>
+          <div style="font-size:12px;color:var(--fg-muted);">Profile: ${profile} · Port: ${res.port || 'N/A'} · Mode: ${res.gatewayMode}</div>
+        </div>
+      </div>`;
+
+    // Checks list
+    html += '<div class="health-checks">';
+    for (const [key, value] of Object.entries(res.checks)) {
+      const icon = value ? '✅' : '❌';
+      const label = key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      html += `<div class="health-check-row">${icon} <span>${label}</span></div>`;
+    }
+    html += '</div>';
+
+    // Issues
+    if (res.issues.length > 0) {
+      html += '<div class="health-issues" style="margin-top:8px;">';
+      for (const issue of res.issues) {
+        html += `<div class="health-issue">⚠️ ${escapeHtml(issue)}</div>`;
+      }
+      html += '</div>';
+    }
+
+    // Auto-fix button
+    if (!res.healthy) {
+      html += `<div style="margin-top:12px;">
+        <button class="btn btn-primary btn-sm" onclick="fixGateway('${profile}')">🔧 Auto-Fix</button>
+      </div>`;
+    }
+
+    html += '</div>';
+    container.innerHTML = html;
+  } catch (e) {
+    container.innerHTML = '<div class="error-msg">Health check failed</div>';
+  }
+}
+
+async function fixGateway(profile) {
+  const confirmed = await showModal({
+    title: 'Fix Gateway',
+    message: `Restart gateway service for profile <code>${profile}</code>?`,
+    buttons: [
+      { text: 'Cancel', value: false },
+      { text: 'Restart', value: true, primary: true },
+    ],
+  });
+  if (!confirmed?.action) return;
+
+  try {
+    const res = await api(`/api/gateway/${profile}/start`, { method: 'POST' });
+    if (res.ok) {
+      showToast('Gateway restarted', 'success');
+      // Re-check health after a moment
+      setTimeout(() => {
+        const el = document.getElementById('gateway-health');
+        if (el) renderGatewayHealth(el, profile);
+      }, 3000);
+    } else {
+      showToast('Failed: ' + (res.error || 'unknown'), 'error');
+    }
+  } catch (e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+}
+
+window.fixGateway = fixGateway;
 
 async function loadGatewayConnections(name) {
   const el = document.getElementById(`gateway-connections-${name}`);

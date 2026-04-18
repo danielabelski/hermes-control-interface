@@ -1906,3 +1906,26 @@
   overflow-y: auto;
   margin: 8px 0;
 }
+
+/* Gateway Health Check */
+.gateway-health-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-bottom: 12px;
+}
+
+.health-check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+
+.health-issue {
+  font-size: 12px;
+  color: var(--coral);
+  padding: 2px 0;
+}
