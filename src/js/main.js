@@ -367,21 +367,75 @@ async function refreshChatSidebar() {
       return;
     }
 
+    // Detect source for each session
+    const sourceLabels = { telegram: '💬 Telegram', discord: '💜 Discord', slack: '🟡 Slack', cron: '⏰ Cron', web: '🌐 Web Chat', other: '📝 Other' };
+    const sourceIcons = { telegram: '💬', discord: '💜', slack: '🟡', cron: '⏰', web: '🌐', other: '📝' };
+    
+    function detectSource(s) {
+      const id = s.id || '';
+      if (id.startsWith('cron_')) return 'cron';
+      // Check if UUID format (Discord/Slack/Telegram sessions)
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-/.test(id);
+      if (isUuid) return 'web'; // Could be platform-specific, default to web
+      return 'other';
+    }
+
+    // Group sessions by source
+    const groups = {};
+    sessions.forEach(s => {
+      const src = s.source || detectSource(s);
+      if (!groups[src]) groups[src] = [];
+      groups[src].push(s);
+    });
+
+    // Render grouped sessions
     const currentSid = state._currentChatSession;
-    listEl.innerHTML = sessions.slice(0, 50).map(s => {
-      const title = toDisplayText((s.title && s.title !== '—') ? s.title : s.id);
-      const isActive = s.id == currentSid;
-      const msgs = s.messageCount || s.message_count || 0;
-      const model = s.model || '';
-      const modelTag = model ? `<span style="font-size:9px;background:var(--bg-panel);padding:1px 4px;border-radius:3px;color:var(--fg-subtle);">${escapeHtml(model.split('/').pop())}</span>` : '';
-      return `<div class="chat-session-item ${isActive ? 'active' : ''}" data-sid="${s.id}" data-title="${escapeHtml(title)}" onclick="loadChatSession('${s.id}')">
-        <div class="chat-session-title">${escapeHtml(title.substring(0, 45))}</div>
-        <div class="chat-session-meta">
-          <span>${msgs} msgs</span>
-          ${modelTag}
+    let html = '';
+    const groupOrder = ['other', 'telegram', 'discord', 'slack', 'web', 'cron'];
+    
+    // Sort groups: put the one with most recent activity first
+    const sortedGroups = Object.entries(groups).sort((a, b) => {
+      const aIdx = groupOrder.indexOf(a[0]);
+      const bIdx = groupOrder.indexOf(b[0]);
+      return (aIdx === -1 ? 99 : aIdx) - (bIdx === -1 ? 99 : bIdx);
+    });
+
+    // If only one group with <=5 sessions, don't group — flat list
+    const showGroups = sortedGroups.length > 1 || (sortedGroups.length === 1 && sortedGroups[0][1].length > 5);
+
+    for (const [source, items] of sortedGroups) {
+      const label = sourceLabels[source] || source;
+      
+      if (showGroups) {
+        html += `<div class="chat-session-group" onclick="this.classList.toggle('collapsed'); this.nextElementSibling.classList.toggle('collapsed');">
+          <span class="group-chevron">▼</span>
+          <span>${label}</span>
+          <span style="margin-left:auto;font-size:9px;color:var(--fg-subtle);">${items.length}</span>
         </div>
-      </div>`;
-    }).join('');
+        <div class="chat-session-group-items">`;
+      }
+
+      for (const s of items.slice(0, showGroups ? 50 : 50)) {
+        const title = toDisplayText((s.title && s.title !== '—') ? s.title : s.id);
+        const isActive = s.id == currentSid;
+        const msgs = s.messageCount || s.message_count || 0;
+        const model = s.model || '';
+        const modelTag = model ? `<span class="session-model-tag">${escapeHtml(model.split('/').pop())}</span>` : '';
+        html += `<div class="chat-session-item ${isActive ? 'active' : ''}" data-sid="${s.id}" data-title="${escapeHtml(title)}" onclick="loadChatSession('${s.id}')">
+          <div class="chat-session-title">${escapeHtml(title.substring(0, 45))}</div>
+          <div class="chat-session-meta">
+            <span>${msgs} msgs</span>
+            ${modelTag}
+          </div>
+        </div>`;
+      }
+
+      if (showGroups) {
+        html += '</div>';
+      }
+    }
+
+    listEl.innerHTML = html;
   } catch {}
 }
 
