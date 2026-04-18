@@ -2751,8 +2751,13 @@ app.put('/api/config/:profile', requireAuth, requireRole('admin'), async (req, r
         },
       };
       console.log(`[ConfigSave] Auto-injected api_server on port ${port} for ${profile}`);
-      // Start gateway service if not running
-      try { await shell(`systemctl restart hermes-gateway-${profile} 2>&1`, '15s'); } catch {}
+      // Start gateway service if profile exists and service file exists
+      const svcFile = `/etc/systemd/system/hermes-gateway-${profile}.service`;
+      if (fs.existsSync(svcFile)) {
+        try { await shell(`systemctl daemon-reload && systemctl restart hermes-gateway-${profile} 2>&1`, '15s'); } catch {}
+      } else {
+        console.log(`[ConfigSave] No gateway service for ${profile}, skipping restart`);
+      }
       gatewayPorts = discoverGatewayPorts();
     }
 
@@ -3851,6 +3856,14 @@ app.delete('/api/profiles/:name', requireRole('admin'), async (req, res) => {
     const output = await shell(`hermes profile delete ${name} -y 2>&1`);
     audit(req.hciUser?.username || 'unknown', req.hciUser?.role || 'unknown', 'PROFILE_DELETE', name);
     addNotification('info', `Profile deleted: ${name}`);
+    // Clean up gateway service
+    try {
+      await shell(`systemctl stop hermes-gateway-${name} 2>/dev/null; systemctl disable hermes-gateway-${name} 2>/dev/null; rm -f /etc/systemd/system/hermes-gateway-${name}.service; systemctl daemon-reload 2>&1`, '10s');
+      console.log(`[ProfileDelete] Cleaned up gateway service for ${name}`);
+    } catch {}
+    // Refresh port discovery
+    gatewayPorts = discoverGatewayPorts();
+    // Invalidate cache
     getProfiles.cache = { at: 0, data: [] };
     res.json({ ok: true, output });
   } catch (e) {
