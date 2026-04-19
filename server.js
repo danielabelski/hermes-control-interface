@@ -1954,9 +1954,9 @@ app.get('/api/dashboard-state', requireAuth, async (req, res) => {
   res.json(await buildDashboardState(true));
 });
 
-app.get('/api/sessions', requireAuth, (req, res) => {
+app.get('/api/sessions', requireAuth, async (req, res) => {
   // Short list for sidebar — limit 10, cached 10s
-  const data = getSessions();
+  const data = await getSessions();
   res.json({ sessions: data, cachedAt: hermesSidebarSessionsCache.at });
 });
 
