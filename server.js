@@ -3801,63 +3801,138 @@ app.get('/api/usage/:days', requireAuth, requirePerm('usage.view'), async (req, 
     const days = Math.min(parseInt(req.params.days || '7', 10), 90);
     const profile = sanitizeProfileName(req.query.profile) || undefined;
 
+    // Determine which state.db paths to query
+    let dbPaths = [];
     if (profile) {
-      // Single profile
-      const raw = await shell(`hermes --profile ${profile} insights --days ${days} 2>&1`, '60s');
-      const parsed = parseInsights(raw);
-      return res.json({ ok: true, ...parsed, raw });
+      const p = profile !== 'default'
+        ? path.join(os.homedir(), '.hermes', 'profiles', profile, 'state.db')
+        : STATE_DB_PATH;
+      if (!fs.existsSync(p)) return res.json({ ok: false, error: 'state.db not found' });
+      dbPaths = [{ profile: profile || 'default', path: p }];
+    } else {
+      // All profiles
+      const profilesDir = path.join(os.homedir(), '.hermes', 'profiles');
+      if (fs.existsSync(profilesDir)) {
+        for (const entry of fs.readdirSync(profilesDir, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue;
+          const dbPath = path.join(profilesDir, entry.name, 'state.db');
+          if (fs.existsSync(dbPath)) dbPaths.push({ profile: entry.name, path: dbPath });
+        }
+      }
+      // Include default profile
+      if (fs.existsSync(STATE_DB_PATH)) {
+        dbPaths.push({ profile: 'default', path: STATE_DB_PATH });
+      }
+      if (dbPaths.length === 0) return res.json({ ok: false, error: 'No state.db found' });
     }
 
-    // All profiles — aggregate
-    const profilesRaw = await shell('hermes profile list 2>&1', '15s');
-    const profiles = parseHermesProfileList(profilesRaw);
-    const profileNames = profiles.map(p => p.name);
-
-    if (profileNames.length === 0) {
-      const raw = await shell(`hermes insights --days ${days} 2>&1`, '60s');
-      return res.json({ ok: true, ...parseInsights(raw), raw });
-    }
-
-    // Fetch insights for all profiles in parallel
-    const results = await Promise.allSettled(
-      profileNames.map(p => shell(`hermes --profile ${p} insights --days ${days} 2>&1`, '60s').then(r => ({ profile: p, parsed: parseInsights(r) })))
-    );
-
-    // Aggregate
-    const agg = { sessions: 0, messages: 0, toolCalls: 0, userMessages: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: '$0.00', activeTime: '', avgSession: '', period: `${days} days (all profiles)`, models: [], platforms: [], topTools: [] };
+    // Aggregate across all DBs
     const modelMap = {};
     const platformMap = {};
     const toolMap = {};
-    let totalCost = 0;
+    let totalSessions = 0, totalMessages = 0, totalToolCalls = 0;
+    let totalInput = 0, totalOutput = 0, totalCost = 0;
 
-    for (const r of results) {
-      if (r.status !== 'fulfilled') continue;
-      const p = r.value.parsed;
-      agg.sessions += p.sessions || 0;
-      agg.messages += p.messages || 0;
-      agg.toolCalls += p.toolCalls || 0;
-      agg.inputTokens += p.inputTokens || 0;
-      agg.outputTokens += p.outputTokens || 0;
-      agg.totalTokens += p.totalTokens || 0;
-      const costNum = parseFloat((p.cost || '$0').replace(/[$,]/g, '')) || 0;
-      totalCost += costNum;
-      for (const m of (p.models || [])) {
-        if (!modelMap[m.name]) modelMap[m.name] = { name: m.name, sessions: 0, tokens: 0 };
-        modelMap[m.name].sessions += m.sessions || 0;
-        modelMap[m.name].tokens += parseInt((m.tokens || '0').replace(/,/g, ''), 10) || 0;
-      }
-      for (const pl of (p.platforms || [])) {
-        if (!platformMap[pl.name]) platformMap[pl.name] = { name: pl.name, sessions: 0, tokens: 0 };
-        platformMap[pl.name].sessions += pl.sessions || 0;
-        platformMap[pl.name].tokens += parseInt((pl.tokens || '0').replace(/,/g, ''), 10) || 0;
+    for (const { path: dbPath } of dbPaths) {
+      const db = new Database(dbPath, { readonly: true });
+      try {
+        const since = `-${days}`;
+        const sessions = db.prepare(`
+          SELECT model, source, billing_provider,
+                 input_tokens, output_tokens, cache_read_tokens,
+                 message_count, tool_call_count
+          FROM sessions
+          WHERE started_at > strftime('%s', 'now', ? || ' days')
+        `).all(since);
+
+        for (const s of sessions) {
+          const cost = calculateCost(s.model, s.input_tokens || 0, s.output_tokens || 0, s.cache_read_tokens || 0, s.billing_provider);
+          const tokens = (s.input_tokens || 0) + (s.output_tokens || 0);
+
+          totalSessions++;
+          totalInput += s.input_tokens || 0;
+          totalOutput += s.output_tokens || 0;
+          totalCost += cost;
+          totalMessages += s.message_count || 0;
+          totalToolCalls += s.tool_call_count || 0;
+
+          const mKey = s.model || 'unknown';
+          if (!modelMap[mKey]) modelMap[mKey] = { name: mKey, sessions: 0, tokens: 0 };
+          modelMap[mKey].sessions++;
+          modelMap[mKey].tokens += tokens;
+
+          const pKey = s.source || 'unknown';
+          if (!platformMap[pKey]) platformMap[pKey] = { name: pKey, sessions: 0, tokens: 0 };
+          platformMap[pKey].sessions++;
+          platformMap[pKey].tokens += tokens;
+        }
+
+        // Top tools
+        const tools = db.prepare(`
+          SELECT tool_name, COUNT(*) as calls
+          FROM messages
+          WHERE tool_name IS NOT NULL AND tool_name != ''
+            AND timestamp > strftime('%s', 'now', ? || ' days')
+          GROUP BY tool_name
+          ORDER BY calls DESC
+          LIMIT 10
+        `).all(since);
+
+        for (const t of (tools || [])) {
+          if (!toolMap[t.tool_name]) toolMap[t.tool_name] = { name: t.tool_name, calls: 0 };
+          toolMap[t.tool_name].calls += t.calls;
+        }
+      } finally {
+        db.close();
       }
     }
 
-    agg.cost = '$' + totalCost.toFixed(2);
-    agg.models = Object.values(modelMap).sort((a, b) => b.tokens - a.tokens);
-    agg.platforms = Object.values(platformMap).sort((a, b) => b.sessions - a.sessions);
+    // Calculate active time (avg session duration)
+    let avgDuration = 0;
+    for (const { path: dbPath } of dbPaths) {
+      const db = new Database(dbPath, { readonly: true });
+      try {
+        const dur = db.prepare(`
+          SELECT AVG(ended_at - started_at) as avg_dur
+          FROM sessions
+          WHERE started_at > strftime('%s', 'now', ? || ' days') AND ended_at > 0
+        `).get(`-${days}`);
+        if (dur?.avg_dur) avgDuration += dur.avg_dur;
+      } finally {
+        db.close();
+      }
+    }
+    avgDuration = dbPaths.length > 0 ? avgDuration / dbPaths.length : 0;
 
-    res.json({ ok: true, ...agg });
+    // Format active time
+    const formatDuration = (secs) => {
+      if (!secs || secs < 60) return '—';
+      const h = Math.floor(secs / 3600);
+      const m = Math.floor((secs % 3600) / 60);
+      return h > 0 ? `${h}h ${m}m` : `${m}m`;
+    };
+
+    const topTools = Object.values(toolMap)
+      .sort((a, b) => b.calls - a.calls)
+      .slice(0, 5)
+      .map(t => ({ ...t, pct: totalToolCalls > 0 ? ((t.calls / totalToolCalls) * 100).toFixed(1) + '%' : '0%' }));
+
+    res.json({
+      ok: true,
+      sessions: totalSessions,
+      messages: totalMessages,
+      toolCalls: totalToolCalls,
+      inputTokens: totalInput,
+      outputTokens: totalOutput,
+      totalTokens: totalInput + totalOutput,
+      cost: '$' + totalCost.toFixed(2),
+      activeTime: formatDuration(avgDuration),
+      avgSession: formatDuration(avgDuration),
+      period: `${days} days${profile ? ` (${profile})` : ' (all profiles)'}`,
+      models: Object.values(modelMap).sort((a, b) => b.tokens - a.tokens),
+      platforms: Object.values(platformMap).sort((a, b) => b.sessions - a.sessions),
+      topTools,
+    });
   } catch (e) {
     res.json({ ok: false, error: e.message });
   }

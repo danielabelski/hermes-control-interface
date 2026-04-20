@@ -3733,7 +3733,6 @@ async function loadMaintenance(container) {
       </div>
       <div class="card">
         <div class="card-title">HCI Info</div>
-        <div style="font-size:12px;color:var(--fg-muted);margin-bottom:10px;">Version <span id="hci-info-version" style="color:var(--accent);font-weight:600;">—</span></div>
         <div class="stat-row"><span class="stat-label">GitHub</span><span class="stat-value"><a href="https://github.com/xaspx/hermes-control-interface" target="_blank" style="color:var(--accent);text-decoration:none;">🔗 xaspx/hermes-control-interface</a></span></div>
         <div class="stat-row"><span class="stat-label">Twitter</span><span class="stat-value"><a href="https://x.com/bayendor" target="_blank" style="color:var(--accent);text-decoration:none;">@bayendor</a></span></div>
       </div>
@@ -3745,7 +3744,6 @@ async function loadMaintenance(container) {
     const healthRes = await api('/api/system/health');
     if (healthRes.ok) {
       document.getElementById('update-version').textContent = healthRes.hermes_version || '—';
-      document.getElementById('hci-info-version').textContent = healthRes.hci_version || '3.2.0';
     }
   } catch {}
 
