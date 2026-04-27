@@ -4,6 +4,8 @@
 import { Chart, registerables } from 'chart.js';
 import { toDisplayText } from './chat-render-utils.mjs';
 import { resolveSessionDisplayTitle } from './session-title-utils.mjs';
+import { SSE_EVENT_TYPES, mapWsType } from '../../lib/sse-events.js';
+import { wsClient } from './ws-client.js';
 Chart.register(...registerables);
 
 // State
@@ -16,7 +18,15 @@ const state = {
   notifInterval: null,
   notifFailCount: 0,
   _currentChatSession: null,
+  _optMessages: null, // Map<optId, {text, el, ts}>
+  _recentMessages: null, // Ring buffer for dedup {role, content, ts}[]
   chatSidebarOpen: localStorage.getItem('hci-chat-sidebar') !== 'false',
+  _wsConnected: false, // WebSocket connection state
+  _soundEnabled: false, // Sound notification preference
+  _soundReady: false, // Audio element initialized
+  _soundEl: null, // Audio element ref
+  _wsToolCount: 0, // Live count of running tools
+  _artifactCount: 0, // Live count of artifacts created
   auditDisplayLimit: 15,
 };
 
@@ -90,6 +100,44 @@ function showApp() {
   updateUserMenu();
   navigate(state.page);
   startNotifPolling();
+
+  // ── Phase 3: Session Restore ──
+  // Restore last session from localStorage after sidebar loads
+  const lastSid = localStorage.getItem('hci-last-session');
+  if (lastSid && state.page === 'chat') {
+    // Poll until sessions are loaded in DOM
+    let attempts = 0;
+    const tryRestore = () => {
+      attempts++;
+      const exists = document.querySelector(`.chat-session-item[data-sid="${lastSid}"]`);
+      if (exists) {
+        loadChatSession(lastSid);
+      } else if (attempts < 10) {
+        setTimeout(tryRestore, 400);
+      } else {
+        localStorage.removeItem('hci-last-session');
+      }
+    };
+    setTimeout(tryRestore, 300);
+  }
+
+  // Phase 3: init gateway health badge (defer until DOM renders)
+  if (state.page === 'chat') setTimeout(() => updateGatewayBadge().catch(() => {}), 100);
+  // Connect WebSocket for real-time events — add listeners BEFORE connect to avoid race
+  wsClient.addEventListener('open', () => {
+    state._wsConnected = true;
+    updateWsConnectionUI(true);
+  });
+  wsClient.addEventListener('close', () => {
+    state._wsConnected = false;
+    updateWsConnectionUI(false);
+  });
+  if (wsClient.connected) {
+    // Already connected (e.g. reconnect before showApp re-runs)
+    updateWsConnectionUI(true);
+  }
+  wsClient.connect();
+  setupWsChatHandlers();
 }
 
 function updateUserMenu() {
@@ -211,6 +259,10 @@ async function loadPage(page, params = {}) {
       case 'agents':
         await loadAgents(container);
         break;
+      case 'mon':
+        // MON page merged into Home — redirect
+        navigate('home');
+        break;
       case 'agent-detail':
         await loadAgentDetail(container, params);
         break;
@@ -235,11 +287,14 @@ async function loadPage(page, params = {}) {
       case 'logs':
         await loadLogs(container);
         break;
+      case 'mon':
+        await loadMonitoring(container);
+        break;
       default:
         container.innerHTML = `<div class="empty">Page not found</div>`;
     }
   } catch (err) {
-    container.innerHTML = `<div class="empty">Error loading page: ${err.message}</div>`;
+    container.innerHTML = `<div class="empty">Error loading page: ${escapeHtml(err.message)}</div>`;
   }
 }
 
@@ -255,6 +310,7 @@ async function loadChat(container) {
   } catch {}
   const profileOptions = profiles.map(p => `<option value="${p.name}">${p.name}${p.active ? ' ★' : ''}</option>`).join('');
   const defaultProfile = profiles.find(p => p.active)?.name || 'default';
+  state._defaultProfile = defaultProfile;
 
   // Sidebar state
   const sidebarCollapsed = state.chatSidebarOpen ? '' : ' collapsed';
@@ -272,8 +328,17 @@ async function loadChat(container) {
           <input type="text" id="chat-session-search" class="search-input" placeholder="Search sessions..." />
           <button class="btn btn-primary btn-sm" style="width:100%;margin-top:6px;" onclick="newChatSession()">+ New Chat</button>
         </div>
+        <div id="chat-agent-panel" class="chat-agent-panel">
+          <div class="chat-agent-panel-title">🤖 Active Agent</div>
+          <div id="chat-agent-panel-body">
+            <!-- Populated by updateChatAgentPanel() -->
+          </div>
+        </div>
         <div class="chat-sidebar-list" id="chat-sidebar-list">
           <div class="loading">Loading sessions...</div>
+        </div>
+        <div id="subagent-panel" class="subagent-panel" style="display:none;">
+          <div class="subagent-panel-title">Subagents</div>
         </div>
       </div>
       <div class="chat-sidebar-backdrop" id="chat-sidebar-backdrop" onclick="toggleChatSidebar()"></div>
@@ -289,19 +354,26 @@ async function loadChat(container) {
             </div>
           </div>
           <div class="chat-header-right">
+            <span id="chat-gateway-badge" class="chat-header-badge" title="Gateway status">🌐 …</span>
             <span class="chat-header-model-badge" id="chat-model-badge" style="display:none;"></span>
-            <button class="btn btn-ghost btn-sm" onclick="renameChatSession()" title="Rename">✏</button>
-            <button class="btn btn-ghost btn-sm btn-danger" onclick="deleteChatSession()" title="Delete">🗑</button>
+            <button class="btn btn-ghost btn-sm" onclick="renameChatSession()" title="Rename">✏️</button>
+            <button class="btn btn-ghost btn-sm btn-danger" onclick="deleteChatSession()" title="Delete">🗑️</button>
           </div>
         </div>
         <div class="chat-messages" id="chat-messages"></div>
         <div class="chat-status-bar" id="chat-status-bar">
-          <span id="chat-status-session">—</span>
-          <span id="chat-status-tokens"></span>
-          <span id="chat-status-elapsed"></span>
+          <div class="chat-status-left">
+            <span id="agent-status-indicator" class="status-idle">ready</span>
+            <span id="chat-status-session" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">—</span>
+          </div>
+          <div class="chat-status-right">
+            <span id="chat-status-tokens"></span>
+            <span id="chat-status-elapsed"></span>
+          </div>
         </div>
         <div class="chat-input-area">
           <textarea id="chat-input" placeholder="Type a message... (Enter to send)" rows="1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChatMessage();}"></textarea>
+          <span id="chat-queue-badge" class="queue-badge" style="display:none;">0</span>
           <button class="btn btn-primary" id="chat-send-btn" onclick="sendChatMessage()">Send</button>
           <button class="btn btn-danger btn-sm" id="chat-stop-btn" style="display:none;" onclick="stopChatStream()">Stop</button>
         </div>
@@ -309,15 +381,134 @@ async function loadChat(container) {
     </div>
   `;
 
+  // ── Keyboard shortcuts ──
+  document.addEventListener('keydown', (e) => {
+    const active = document.activeElement;
+    const isInput = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA');
+
+    // Ctrl/Cmd + Enter = send
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      sendChatMessage();
+      return;
+    }
+
+    // Esc = stop stream or close modal
+    if (e.key === 'Escape') {
+      if (state._chatLock) {
+        e.preventDefault();
+        stopChatStream();
+      } else if (document.querySelector('.modal-overlay')) {
+        closeModal();
+      }
+      return;
+    }
+
+    // Ctrl/Cmd + N = new chat
+    if ((e.ctrlKey || e.metaKey) && e.key === 'n') {
+      e.preventDefault();
+      newChatSession();
+      return;
+    }
+
+    // Ctrl/Cmd + K = focus session search
+    if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+      e.preventDefault();
+      const search = document.getElementById('chat-session-search');
+      if (search) search.focus();
+      return;
+    }
+
+    // Ctrl/Cmd + [ = toggle sidebar
+    if ((e.ctrlKey || e.metaKey) && e.key === 'BracketLeft') {
+      e.preventDefault();
+      toggleChatSidebar();
+      return;
+    }
+
+    // Ctrl/Cmd + / = show shortcuts help
+    if ((e.ctrlKey || e.metaKey) && e.key === '/') {
+      e.preventDefault();
+      showModal({
+        title: 'Keyboard Shortcuts',
+        body: `<div style="display:grid;grid-template-columns:auto 1fr;gap:8px 16px;font-size:13px;">
+          <kbd>Ctrl+Enter</kbd><span>Send message</span>
+          <kbd>Esc</kbd><span>Stop stream / close modal</span>
+          <kbd>Ctrl+N</kbd><span>New chat</span>
+          <kbd>Ctrl+K</kbd><span>Search sessions</span>
+          <kbd>Ctrl+[</kbd><span>Toggle sidebar</span>
+          <kbd>Shift+Enter</kbd><span>New line in input</span>
+        </div>`,
+        confirmText: 'Got it',
+      });
+      return;
+    }
+  });
+
+
   // Set default profile
   const profileSelect = document.getElementById('chat-profile');
   if (profileSelect) profileSelect.value = defaultProfile;
 
+  // Cache profiles for the info panel
+  _chatInfoProfiles = profiles;
+
   // Load sessions
   await refreshChatSidebar();
+  updateChatAgentPanel().catch(() => {}); // Populate sidebar agent panel
 
-  // Profile change → refresh sidebar
-  profileSelect?.addEventListener('change', () => { refreshChatSidebar(); });
+  // Profile change → refresh sidebar + update gateway badge
+  // If switching to a non-default profile AND no active session (new-chat scenario),
+  // prompt the user to set it as their default agent.
+  profileSelect?.addEventListener('change', async () => {
+    const selected = profileSelect.value;
+    const hermesDefault = state._defaultProfile || 'default';
+    // Only prompt if: (1) not already the Hermes default, (2) no active session (new chat)
+    if (selected !== hermesDefault && !state._currentChatSession) {
+      const useDefault = await showModal({
+        title: 'Set as Default Agent?',
+        message: `Switch to <strong>${escapeHtml(selected)}</strong> for new chats? This will change your default agent.`,
+        buttons: [
+          { text: 'Cancel', primary: false, value: false },
+          { text: `Set as Default`, primary: true, value: true },
+        ],
+      });
+      if (useDefault?.action === true) {
+        // User confirmed — call hermes profile use to switch Hermes CLI default
+        try {
+          const csrfToken = state.csrfToken || '';
+          const res = await fetch('/api/profiles/use', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+            credentials: 'include',
+            body: JSON.stringify({ profile: selected }),
+          });
+          const data = await res.json();
+          if (data.ok) {
+            state._defaultProfile = selected;
+            profileSelect.value = selected; // Keep selector in sync with Hermes default
+            showToast(`Default agent set to ${selected}`, 'success');
+            updateChatAgentPanel().catch(() => {}); // Refresh agent panel
+          } else {
+            showToast(data.error || 'Failed to set default', 'error');
+            profileSelect.value = hermesDefault;
+          }
+        } catch (e) {
+          showToast('Failed to set default: ' + e.message, 'error');
+          profileSelect.value = hermesDefault;
+        }
+      } else {
+        // User cancelled or overlay-clicked — revert to Hermes default (do NOT apply selected for new chats)
+        profileSelect.value = hermesDefault;
+        refreshChatSidebar();
+        updateGatewayBadge().catch(() => {});
+        return;
+      }
+    }
+    refreshChatSidebar();
+    updateGatewayBadge().catch(() => {});
+    updateChatAgentPanel().catch(() => {}); // Refresh agent panel on profile change
+  });
 
   // Session search
   document.getElementById('chat-session-search')?.addEventListener('input', (e) => {
@@ -327,13 +518,22 @@ async function loadChat(container) {
     });
   });
 
-  // Auto-resize textarea
+  // Auto-resize textarea + save draft
   const textarea = document.getElementById('chat-input');
   if (textarea) {
     textarea.addEventListener('input', () => {
       textarea.style.height = 'auto';
       textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
+      // Save draft per session
+      const sid = state._currentChatSession || '_new';
+      try { localStorage.setItem('hci_chat_draft_' + sid, textarea.value); } catch {}
     });
+    // Restore draft
+    const sid = state._currentChatSession || '_new';
+    try {
+      const draft = localStorage.getItem('hci_chat_draft_' + sid);
+      if (draft) { textarea.value = draft; textarea.dispatchEvent(new Event('input')); }
+    } catch {}
   }
 
   // Mobile: always start sidebar collapsed (ignore localStorage)
@@ -398,6 +598,15 @@ async function refreshChatSidebar() {
     // Add normalized source to sessions
     sessions = sessions.map(s => ({ ...s, _source: normalizeSource(s) }));
 
+    // Sort: pinned first, then by last activity
+    const pinned = JSON.parse(localStorage.getItem('hci_pinned_sessions') || '[]');
+    sessions.sort((a, b) => {
+      const ap = pinned.includes(a.id) ? 1 : 0;
+      const bp = pinned.includes(b.id) ? 1 : 0;
+      if (ap !== bp) return bp - ap;
+      return 0; // preserve API order (already sorted by last activity)
+    });
+
     // Get unique sources for filter
     const uniqueSources = [...new Set(sessions.map(s => s._source))].sort();
 
@@ -430,8 +639,9 @@ async function refreshChatSidebar() {
       const model = s.model || '';
       const modelTag = model ? `<span class="session-model-tag">${escapeHtml(model.split('/').pop())}</span>` : '';
       const sourceIcon = { telegram: '💬', discord: '💜', slack: '🟡', cron: '⏰', api_server: '🔌', cli: '⌨️', web: '🌐', other: '📝' }[s._source] || '';
-      html += `<div class="chat-session-item ${isActive ? 'active' : ''}" data-sid="${s.id}" data-title="${escapeHtml(title)}" onclick="loadChatSession('${s.id}')">
-        <div class="chat-session-title">${sourceIcon} ${escapeHtml(title.substring(0, 40))}</div>
+      const isPinned = pinned.includes(s.id);
+      html += `<div class="chat-session-item ${isActive ? 'active' : ''} ${isPinned ? 'pinned' : ''}" data-sid="${s.id}" data-title="${escapeHtml(title)}" onclick="loadChatSession('${s.id}')">
+        <div class="chat-session-title">${sourceIcon} ${escapeHtml(title.substring(0, 40))}<button class="session-pin-btn" onclick="event.stopPropagation();togglePinSession('${s.id}')" title="${isPinned?'Unpin':'Pin'}">${isPinned?'📌':'○'}</button></div>
         <div class="chat-session-meta">
           <span>${msgs} msgs</span>
           ${modelTag}
@@ -455,9 +665,19 @@ function filterChatBySource(value) {
 }
 
 // Reload current session messages from DB (silent — no loading indicator)
+let _reloadInProgress = false;
 async function reloadCurrentSessionMessages() {
   const sessionId = state._currentChatSession;
   if (!sessionId) return;
+  // Guard: prevent concurrent calls (e.g., double finalizeWsChat race)
+  if (_reloadInProgress) {
+    console.warn('[Chat] reload already in progress, skipping duplicate call');
+    return;
+  }
+  _reloadInProgress = true;
+  // Capture the session ID at call time so a concurrent session
+  // switch cannot cause us to overwrite the new session's view with old data.
+  const expectedSession = sessionId;
   const profile = document.getElementById('chat-profile')?.value || 'default';
   const container = document.getElementById('chat-messages');
   const statsEl = document.getElementById('chat-status-session');
@@ -467,8 +687,15 @@ async function reloadCurrentSessionMessages() {
 
   try {
     const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages?profile=${encodeURIComponent(profile)}`, { credentials: 'include' });
-    if (!r.ok) return;
+    if (!r.ok) { console.warn('[Chat] reload messages failed:', r.status); return; }
     const data = await r.json();
+
+    // Stale guard: if the session switched while the fetch was in flight,
+    // discard the response to avoid overwriting the new session's view.
+    if (state._currentChatSession !== expectedSession) {
+      console.warn('[Chat] session changed during reload, discarding stale response');
+      return;
+    }
 
     // Token info
     if (tokensEl && data.session) {
@@ -486,7 +713,7 @@ async function reloadCurrentSessionMessages() {
       modelBadge.style.display = 'none';
     }
 
-    if (!data.messages || data.messages.length === 0) return;
+    if (!data.messages || data.messages.length === 0) { console.warn('[Chat] no messages in session'); _reloadInProgress = false; return; }
 
     // Rebuild messages cleanly
     container.innerHTML = '';
@@ -495,10 +722,11 @@ async function reloadCurrentSessionMessages() {
     }
     highlightCodeBlocks(container);
     container.scrollTop = container.scrollHeight;
-  } catch {}
+  } catch (e) { console.error('[Chat] reload messages error:', e); }
+  finally { _reloadInProgress = false; }
 }
 
-async function loadChatSession(sessionId) {
+async function loadChatSession(sessionId, offset = 0) {
   const profile = document.getElementById('chat-profile')?.value || 'default';
   const container = document.getElementById('chat-messages');
   const titleEl = document.getElementById('chat-title');
@@ -507,7 +735,21 @@ async function loadChatSession(sessionId) {
   const tokensEl = document.getElementById('chat-status-tokens');
   if (!container) return;
   state._currentChatSession = sessionId || null;
+  if (sessionId) localStorage.setItem('hci-last-session', sessionId);
+  else localStorage.removeItem('hci-last-session');
   if (statsEl) statsEl.textContent = sessionId || '—';
+
+  // Restore draft for this session
+  const draftInput = document.getElementById('chat-input');
+  if (draftInput) {
+    try {
+      const draft = localStorage.getItem('hci_chat_draft_' + (sessionId || '_new'));
+      draftInput.value = draft || '';
+      draftInput.style.height = 'auto';
+      if (draft) draftInput.style.height = Math.min(draftInput.scrollHeight, 120) + 'px';
+    } catch {}
+  }
+
   container.innerHTML = '<div class="loading">Loading messages...</div>';
 
   // Highlight active in sidebar
@@ -521,7 +763,7 @@ async function loadChatSession(sessionId) {
   }
 
   try {
-    const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages?profile=${encodeURIComponent(profile)}`, { credentials: 'include' });
+    const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages?profile=${encodeURIComponent(profile)}&offset=${offset}&limit=50`, { credentials: 'include' });
     if (!r.ok) { container.innerHTML = '<div class="error-msg">Failed to load messages</div>'; return; }
     const data = await r.json();
     if (titleEl) {
@@ -550,12 +792,41 @@ async function loadChatSession(sessionId) {
       return;
     }
 
-    container.innerHTML = '';
+    // Lazy load older: prepend if offset > 0, else replace
+    if (offset === 0) {
+      container.innerHTML = '';
+    }
+    const frag = document.createDocumentFragment();
     for (const m of data.messages) {
-      container.appendChild(renderChatMessage(m));
+      frag.appendChild(renderChatMessage(m));
+    }
+    if (offset > 0 && container.firstChild) {
+      container.insertBefore(frag, container.firstChild);
+      // Remove old "Load older" button
+      const oldBtn = container.querySelector('.load-older-btn');
+      if (oldBtn) oldBtn.remove();
+    } else {
+      container.appendChild(frag);
+    }
+    // Add "Load older" button if we got 50 messages (more likely exist)
+    if (data.messages.length === 50 && offset === 0) {
+      const loadBtn = document.createElement('button');
+      loadBtn.className = 'load-older-btn';
+      loadBtn.textContent = '↑ Load older messages';
+      loadBtn.onclick = () => {
+        loadBtn.textContent = 'Loading...';
+        loadBtn.disabled = true;
+        loadChatSession(sessionId, offset + 50).then(() => {
+          loadBtn.remove();
+        }).catch(() => {
+          loadBtn.textContent = '↑ Load older messages';
+          loadBtn.disabled = false;
+        });
+      };
+      container.insertBefore(loadBtn, container.firstChild);
     }
     highlightCodeBlocks(container);
-    container.scrollTop = container.scrollHeight;
+    if (offset === 0) container.scrollTop = container.scrollHeight;
   } catch (e) {
     container.innerHTML = '<div class="error-msg">' + escapeHtml(e.message) + '</div>';
   }
@@ -578,7 +849,7 @@ function renderChatMessage(msg) {
   // Header
   const header = document.createElement('div');
   header.className = 'msg-header';
-  header.innerHTML = `<span class="msg-header-label">${c.icon} ${c.label}</span>${ts ? `<span class="msg-header-time">${ts}</span>` : ''}`;
+  header.innerHTML = `<span class="msg-header-label">${c.icon} ${c.label}</span>${ts ? `<span class="msg-header-time">${ts}</span>` : ''}<button class="msg-menu-btn" onclick="toggleMsgMenu(this, '${role}')" title="Message options">⋮</button>`;
   div.appendChild(header);
 
   // Tool calls — render as collapsible cards
@@ -670,6 +941,12 @@ function newChatSession() {
   `;
   document.querySelectorAll('.chat-session-item').forEach(el => el.classList.remove('active'));
 
+  // Reset profile dropdown to default/active profile
+  const profileSelect = document.getElementById('chat-profile');
+  if (profileSelect && state._defaultProfile) {
+    profileSelect.value = state._defaultProfile;
+  }
+
   return null;
 }
 
@@ -687,11 +964,56 @@ function toggleChatSidebar() {
   }
 }
 
-// Stop active chat stream (Gateway API or CLI)
+// Update the sidebar agent panel with current profile data
+let _chatInfoProfiles = [];
+async function updateChatAgentPanel() {
+  const body = document.getElementById('chat-agent-panel-body');
+  if (!body) return;
+
+  // Reuse cached profiles from sidebar refresh
+  let profiles = _chatInfoProfiles;
+  if (!profiles.length) {
+    body.innerHTML = '<div style="color:var(--fg-muted);font-size:12px;text-align:center;padding:10px;">Loading...</div>';
+    return;
+  }
+
+  const defaultAgent = profiles.find(p => p.active);
+  const selectedName = document.getElementById('chat-profile')?.value || defaultAgent?.name || 'default';
+  const selectedProfile = profiles.find(p => p.name === selectedName) || defaultAgent;
+
+  // Current agent — prominent display
+  const currentCard = selectedProfile ? `
+    <div class="agent-current">
+      <span class="agent-status-dot ${selectedProfile.gateway === 'running' ? 'running' : 'stopped'}"></span>
+      <span class="agent-current-name">${escapeHtml(selectedProfile.name)}</span>
+      ${selectedProfile.active ? '<span class="agent-badge-default">★ default</span>' : ''}
+    </div>
+    <div class="agent-current-meta">${escapeHtml(selectedProfile.model || '—')}</div>
+  ` : '';
+
+  // All agents compact list
+  const agentItems = profiles.map(p => {
+    const isRunning = p.gateway === 'running';
+    return `<div class="agent-list-item">
+      <span class="agent-list-dot ${isRunning ? 'running' : 'stopped'}"></span>
+      <span class="agent-list-name">${escapeHtml(p.name)}</span>
+      <span class="agent-list-model">${escapeHtml((p.model || '—').split('/').pop())}</span>
+      ${p.active ? '<span class="agent-badge-default">★</span>' : ''}
+    </div>`;
+  }).join('');
+
+  body.innerHTML = currentCard + `<div class="agent-list">${agentItems}</div>`;
+}
+
+// Stop active chat stream (Gateway API or CLI or WS)
 function stopChatStream() {
   if (state._currentStreamReader) {
     state._currentStreamReader.cancel().catch(() => {});
     state._currentStreamReader = null;
+  }
+  // Also send WS stop if connected
+  if (wsClient.connected) {
+    wsClient.chatStop();
   }
   state._chatLock = false;
   const sendBtn = document.getElementById('chat-send-btn');
@@ -730,6 +1052,14 @@ async function deleteChatSession(sessionId = 0) {
 }
 
 // ── Update chat header with session info ──
+
+function updateQueueBadge() {
+  const q = state._chatQueue || [];
+  const badge = document.getElementById('chat-queue-badge');
+  if (!badge) return;
+  badge.textContent = q.length;
+  badge.style.display = q.length > 0 ? '' : 'none';
+}
 function updateChatHeader() {
   const sid = state._currentChatSession;
   const titleEl = document.getElementById('chat-title');
@@ -748,22 +1078,43 @@ function updateChatHeader() {
 }
 
 async function sendChatMessage() {
-  if (state._chatLock) return;
   const input = document.getElementById('chat-input');
   const text = input?.value?.trim();
   if (!text) return;
+
+  // Queue if busy
+  if (state._chatLock) {
+    if (!state._chatQueue) state._chatQueue = [];
+    state._chatQueue.push(text);
+    input.value = '';
+    input.style.height = 'auto';
+    updateQueueBadge();
+    return;
+  }
   const profile = document.getElementById('chat-profile')?.value || 'default';
   const sessionId = state._currentChatSession || null;
   input.value = '';
   input.style.height = 'auto';
   state._chatLock = true;
+  // Initialize optimistic + dedup state
+  if (!state._optMessages) state._optMessages = new Map();
+  if (!state._recentMessages) state._recentMessages = { buf: [], max: 20 };
+
+  // Clear draft
+  try { localStorage.removeItem('hci_chat_draft_' + (state._currentChatSession || '_new')); } catch {}
   const btn = document.getElementById('chat-send-btn');
   if (btn) { btn.disabled = true; btn.textContent = '...'; }
   const messagesDiv = document.getElementById('chat-messages');
   if (messagesDiv) {
     const existing = messagesDiv.querySelector('[style*="text-align:center"]');
     if (existing) existing.remove();
-    messagesDiv.appendChild(createMessageDiv('user', text));
+    // Optimistic ID: tag user message so we can swap if needed
+    const optId = 'opt-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
+    const msgEl = createMessageDiv('user', text, optId);
+    messagesDiv.appendChild(msgEl);
+    // Track for dedup + optimistic swap
+    state._optMessages.set(optId, { text, el: msgEl, ts: Date.now() });
+    addToDedupBuf('user', text);
   }
   const streamEl = document.createElement('div');
   streamEl.id = 'chat-streaming';
@@ -779,15 +1130,20 @@ async function sendChatMessage() {
   if (btn) { btn.disabled = true; btn.style.display = 'none'; }
   if (stopBtn) stopBtn.style.display = 'inline-flex';
   try {
-    // All profiles use Gateway API (default, soci, cuan, david)
-    await sendViaGatewayAPI(text, profile, sessionId, contentDiv, messagesDiv, startTime);
-  } catch (gwErr) {
-    console.warn('[Chat] Gateway API failed, falling back to CLI:', gwErr.message);
-    try {
-      await sendViaCLI(text, profile, sessionId, contentDiv, messagesDiv, startTime);
-    } catch (cliErr) {
-      if (contentDiv) contentDiv.innerHTML = renderChatContent(fullContent) + '<div style="color:var(--red);margin-top:8px;">Error: ' + escapeHtml(cliErr.message) + '</div>';
+    // Prefer WebSocket for real-time events (thinking, tool progress, streaming)
+    if (wsClient.connected) {
+      try {
+        await sendViaWebSocket(text, profile, sessionId);
+        return; // WS success — done
+      } catch (wsErr) {
+        console.warn('[Chat] WS failed, falling back to CLI:', wsErr.message);
+      }
     }
+    // Fallback to CLI (Gateway API chat endpoint not available in Hermes)
+    await sendViaCLI(text, profile, sessionId, contentDiv, messagesDiv, startTime);
+  } catch (cliErr) {
+    console.error('[Chat] CLI failed:', cliErr.message);
+    if (contentDiv) contentDiv.innerHTML = renderChatContent(fullContent) + '<div style="color:var(--red);margin-top:8px;">Error: ' + escapeHtml(cliErr.message) + '</div>';
   } finally {
     state._chatLock = false;
     state._currentStreamReader = null;
@@ -914,7 +1270,530 @@ function handleGatewayEvent(evt, contentDiv, messagesDiv, toolCards) {
       // Don't overwrite session_id from hci.session or header
       if (!state._currentChatSession) state._currentChatSession = evt.response.id;
     }
+  } else if (t === 'artifact.created') {
+    handleArtifact(evt.artifact || evt);
+  } else if (t === 'artifact.chunk') {
+    // Accumulate artifact chunks — append to latest artifact card
+    const messagesDiv = document.getElementById('chat-messages');
+    const lastArtifact = messagesDiv?.querySelector('.artifact-card:last-of-type');
+    if (lastArtifact) {
+      const contentEl = lastArtifact.querySelector('.artifact-content');
+      if (contentEl && evt.chunk) {
+        contentEl.textContent = (contentEl.textContent || '') + evt.chunk;
+      }
+    }
+  } else if (t === 'subagent.completed' || t === 'chat.subagent.done') {
+    handleSubagentEvent('done', evt.payload || evt);
   }
+}
+
+// ── WebSocket Chat (TUI events) ──
+function setupWsChatHandlers() {
+  wsClient.addEventListener('message', (ev) => {
+    const msg = ev.detail;
+    switch (msg.type) {
+      case 'chat.thinking':
+        handleThinkingDelta(msg.delta);
+        break;
+      case 'chat.reasoning':
+        handleReasoningDelta(msg.delta);
+        break;
+      case 'chat.start':
+        handleMessageStart();
+        break;
+      case 'chat.text':
+        handleTextDelta(msg.delta);
+        break;
+      case 'chat.status':
+        handleStatusUpdate(msg.status, msg.kind);
+        break;
+      case 'chat.tool.generating':
+        handleToolGenerating(msg.name);
+        break;
+      case 'chat.tool.start':
+        handleToolStart(msg.tool_id, msg.name, msg.context);
+        break;
+      case 'chat.tool.progress':
+        handleToolProgress(msg.name, msg.preview);
+        break;
+      case 'chat.tool.done':
+        handleToolDone(msg.tool_id, msg.name, msg.summary, msg.error, msg.inline_diff);
+        break;
+      case 'chat.artifact':
+        handleArtifact(msg.artifact || msg);
+        break;
+      case 'chat.session':
+        state._currentChatSession = msg.session_id;
+        state._sessionInfo = msg.info;
+        swapOptimisticMessage(msg.session_id);
+        updateChatHeader();
+        break;
+      case 'chat.done':
+        finalizeWsChat();
+        break;
+      case 'chat.error':
+        showChatError(msg.error);
+        break;
+      case 'chat.clarify':
+        showClarifyModal(msg.question, msg.choices, msg.request_id);
+        break;
+      case 'chat.approval':
+        showApprovalModal(msg.command, msg.description);
+        break;
+      case 'chat.sudo':
+        showSudoModal(msg.request_id);
+        break;
+      case 'chat.secret':
+        showSecretModal(msg.env_var, msg.prompt, msg.request_id);
+        break;
+      case 'chat.subagent.start':
+      case 'chat.subagent.progress':
+      case 'chat.subagent.complete':
+        handleSubagentEvent(msg.type, msg.payload);
+        break;
+      case 'tui.ready':
+        console.log('[TUI] Gateway ready');
+        break;
+      case 'tui.stderr':
+        console.log('[TUI] stderr:', msg.line);
+        break;
+      case 'tui.error':
+        console.error('[TUI] error:', msg.error);
+        break;
+    }
+  });
+}
+
+function handleThinkingDelta(delta) {
+  const messagesDiv = document.getElementById('chat-messages');
+  if (!messagesDiv) return;
+  const panel = ensureThinkingPanel(messagesDiv);
+  const textEl = panel.querySelector('.thinking-text');
+  if (textEl) {
+    textEl.textContent += delta;
+    panel.scrollTop = panel.scrollHeight;
+  }
+}
+
+function handleReasoningDelta(delta) {
+  // Same as thinking for now
+  handleThinkingDelta(delta);
+}
+
+function handleMessageStart() {
+  hideThinkingPanel();
+  const messagesDiv = document.getElementById('chat-messages');
+  if (!messagesDiv) return;
+  let streamEl = document.getElementById('chat-streaming');
+  if (!streamEl) {
+    streamEl = document.createElement('div');
+    streamEl.id = 'chat-streaming';
+    streamEl.className = 'chat-msg msg-assistant chat-streaming';
+    streamEl.innerHTML = '<div class="msg-header"><span class="msg-header-label">🤖 Assistant</span></div><div class="msg-body"><span id="gw-stream-text"></span><span class="chat-cursor" style="animation:blink 1s infinite;">▊</span></div>';
+    messagesDiv.appendChild(streamEl);
+  }
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+function handleTextDelta(delta) {
+  const messagesDiv = document.getElementById('chat-messages');
+  if (!messagesDiv) return;
+  // Re-query each time — streaming element may have been replaced by
+  // reloadCurrentSessionMessages() between callback invocations.
+  const streamEl = document.getElementById('chat-streaming');
+  if (!streamEl || !document.contains(streamEl)) return;
+  const body = streamEl.querySelector('.msg-body');
+  if (!body) return;
+  let span = body.querySelector('#gw-stream-text');
+  const cursor = body.querySelector('.chat-cursor');
+  if (!span) {
+    span = document.createElement('span');
+    span.id = 'gw-stream-text';
+    // Guard: cursor may have been removed by reloadCurrentSessionMessages
+    if (cursor && body.contains(cursor)) {
+      body.insertBefore(span, cursor);
+    } else {
+      body.appendChild(span);
+    }
+  }
+  span.textContent += delta;
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+function handleStatusUpdate(status, kind) {
+  const statusEl = document.getElementById('chat-status-bar');
+  if (statusEl) {
+    const sessionSpan = statusEl.querySelector('#chat-status-session');
+    if (sessionSpan) sessionSpan.textContent = status || '';
+  }
+  // Also update a global status indicator
+  const indicator = document.getElementById('agent-status-indicator');
+  if (indicator) {
+    indicator.textContent = status || 'ready';
+    indicator.className = `status-${kind || 'idle'}`;
+  }
+}
+
+function handleToolGenerating(name) {
+  // Tool schema being generated — show subtle indicator
+  console.log('[Tool] Generating:', name);
+}
+
+function handleToolStart(toolId, name, context) {
+  hideThinkingPanel();
+  const tc = ensureToolCards();
+  const messagesDiv = document.getElementById('chat-messages');
+  const streamEl = document.getElementById('chat-streaming');
+  // Guard: if streaming element is no longer in the DOM (e.g. replaced by
+  // finalizeWsChat or a new message cycle), skip tool card insertion.
+  // The messages will be reloaded from DB when the stream finalizes.
+  if (!streamEl || !document.contains(streamEl)) return;
+  const targetDiv = streamEl.querySelector('.msg-body');
+  if (!targetDiv || !document.contains(targetDiv)) return;
+  const card = addToolCallCard(targetDiv, toolId, name, context);
+  tc.set(toolId, card);
+  if (messagesDiv) messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  // Live tool count indicator
+  state._wsToolCount = (state._wsToolCount || 0) + 1;
+  updateToolCountUI();
+}
+
+function handleToolProgress(name, preview) {
+  const tc = ensureToolCards();
+  for (const [id, el] of tc) {
+    // Guard: skip if card is no longer in DOM (orphaned by finalizeWsChat)
+    if (!document.contains(el)) continue;
+    const previewEl = el.querySelector('.tool-card-preview');
+    if (previewEl && preview) previewEl.textContent = preview;
+  }
+}
+
+function handleToolDone(toolId, name, summary, error, inlineDiff) {
+  const tc = ensureToolCards();
+  const card = tc.get(toolId);
+  if (!card) return; // card already removed (e.g. by finalizeWsChat)
+  // Guard: if the card is no longer in the DOM (streaming element replaced),
+  // skip DOM update — messages will be reloaded from DB.
+  if (!document.contains(card)) return;
+  const streamEl = document.getElementById('chat-streaming');
+  if (!streamEl || !document.contains(streamEl)) return;
+  const statusEl = card.querySelector('.tool-card-status');
+  if (statusEl) {
+    statusEl.textContent = error ? 'error' : 'done';
+    statusEl.className = `tool-card-status ${error ? 'error' : 'done'}`;
+  }
+  const resultEl = card.querySelector('.tool-card-result');
+  if (resultEl) {
+    let resultText = error || '';
+    if (!error && inlineDiff) {
+      resultText = inlineDiff;
+    } else if (!error && summary) {
+      resultText = summary;
+    }
+    // 4000-char truncation with expand-on-click
+    if (resultText.length > 4000) {
+      resultEl.innerHTML = `
+        <pre class="tool-result-truncated">${escapeHtml(resultText.substring(0, 4000))}</pre>
+        <button class="tool-expand-btn" onclick="this.previousElementSibling.classList.toggle('tool-result-truncated'); this.previousElementSibling.classList.toggle('tool-result-full'); this.textContent = this.previousElementSibling.classList.contains('tool-result-full') ? 'Show less' : 'Show more (${(resultText.length - 4000).toLocaleString()} more chars)';">Show more (${(resultText.length - 4000).toLocaleString()} more chars)</button>`;
+      resultEl.classList.add('has-expand');
+    } else {
+      resultEl.innerHTML = `<pre>${escapeHtml(resultText)}</pre>`;
+    }
+  }
+  tc.delete(toolId);
+  // Decrement live tool count
+  state._wsToolCount = Math.max(0, (state._wsToolCount || 1) - 1);
+  updateToolCountUI();
+}
+
+function handleSubagentEvent(type, payload) {
+  // Show panel if hidden
+  const panel = document.getElementById('subagent-panel');
+  if (panel) panel.style.display = '';
+  
+  const id = payload.subagent_id;
+  let el = document.getElementById(`subagent-${id}`);
+  
+  if (type === 'chat.subagent.start') {
+    if (!el) {
+      el = document.createElement('div');
+      el.id = `subagent-${id}`;
+      el.className = 'subagent-item';
+      panel.appendChild(el);
+    }
+    el.innerHTML = `<span class="subagent-status running">●</span> ${escapeHtml(payload.goal?.slice(0, 40) || 'Subagent')} <span class="subagent-model">${escapeHtml(payload.model || '')}</span>`;
+  } else if (type === 'chat.subagent.progress') {
+    if (el) {
+      const progress = payload.iteration ? ` (${payload.iteration}/${payload.tool_count || '?'})` : '';
+      el.innerHTML = `<span class="subagent-status running">●</span> ${escapeHtml(payload.goal?.slice(0, 40) || 'Subagent')}${progress}`;
+    }
+  } else if (type === 'chat.subagent.complete') {
+    if (el) {
+      const status = payload.status === 'completed' ? 'completed' : 'failed';
+      const icon = payload.status === 'completed' ? '✅' : '❌';
+      el.innerHTML = `${icon} ${escapeHtml(payload.goal?.slice(0, 40) || 'Subagent')} <span class="subagent-status ${status}">${escapeHtml(payload.status || '')}</span>`;
+      // Auto-remove after 5 seconds
+      setTimeout(() => el?.remove(), 5000);
+    }
+  }
+  
+  // Hide panel if empty
+  if (panel && panel.children.length <= 1) {
+    panel.style.display = 'none';
+  }
+}
+
+// ── Interactive Modals ─────────────────────────────────────────────
+
+function showClarifyModal(question, choices, requestId) {
+  if (!choices || choices.length === 0) {
+    // Open-ended: text input
+    showModal({
+      title: 'Clarification Needed',
+      body: `<p>${escapeHtml(question)}</p><input type="text" id="clarify-input" class="modal-input" placeholder="Your answer..." style="width:100%;margin-top:12px;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg-card);color:var(--fg);">`,
+      confirmText: 'Submit',
+      onConfirm: () => {
+        const input = document.getElementById('clarify-input');
+        if (input) wsClient.clarifyRespond(requestId, input.value);
+      }
+    });
+  } else {
+    // Multiple choice
+    const buttons = choices.map(c => 
+      `<button class="modal-choice-btn" data-choice="${escapeHtml(c)}" style="display:block;width:100%;margin:4px 0;padding:10px;text-align:left;background:var(--bg-card);border:1px solid var(--border);border-radius:8px;color:var(--fg);cursor:pointer;">${escapeHtml(c)}</button>`
+    ).join('');
+    showModal({
+      title: 'Clarification Needed',
+      body: `<p>${escapeHtml(question)}</p><div style="margin-top:12px;">${buttons}</div>`,
+      showCancel: false,
+      confirmText: null,
+      onRender: () => {
+        document.querySelectorAll('.modal-choice-btn').forEach(btn => {
+          btn.onclick = () => {
+            wsClient.clarifyRespond(requestId, null, btn.dataset.choice);
+            closeModal();
+          };
+        });
+      }
+    });
+  }
+}
+
+function showApprovalModal(command, description) {
+  showModal({
+    title: 'Approval Required',
+    body: `
+      <p>${escapeHtml(description || 'The agent wants to run a command:')}</p>
+      <pre style="margin-top:12px;padding:12px;background:var(--bg-dark);border-radius:8px;overflow-x:auto;"><code>${escapeHtml(command)}</code></pre>
+    `,
+    confirmText: '✅ Approve',
+    cancelText: '❌ Deny',
+    onConfirm: () => wsClient.approvalRespond(true, command),
+    onCancel: () => wsClient.approvalRespond(false, command),
+  });
+}
+
+function showSudoModal(requestId) {
+  showModal({
+    title: 'Sudo Password Required',
+    body: `<p>The agent needs sudo privileges. Enter your password:</p><input type="password" id="sudo-input" class="modal-input" placeholder="Password" style="width:100%;margin-top:12px;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg-card);color:var(--fg);">`,
+    confirmText: 'Submit',
+    onConfirm: () => {
+      const input = document.getElementById('sudo-input');
+      if (input) wsClient.sudoRespond(requestId, input.value);
+    }
+  });
+}
+
+function showSecretModal(envVar, prompt, requestId) {
+  showModal({
+    title: `Secret Required: ${escapeHtml(envVar)}`,
+    body: `<p>${escapeHtml(prompt || `Enter value for ${envVar}:`)}</p><input type="password" id="secret-input" class="modal-input" placeholder="Value" style="width:100%;margin-top:12px;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg-card);color:var(--fg);">`,
+    confirmText: 'Submit',
+    onConfirm: () => {
+      const input = document.getElementById('secret-input');
+      if (input) wsClient.secretRespond(requestId, input.value);
+    }
+  });
+}
+
+function ensureThinkingPanel(messagesDiv) {
+  let panel = document.getElementById('chat-thinking-panel');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'chat-thinking-panel';
+    panel.className = 'chat-thinking-panel';
+    panel.innerHTML = '<div class="thinking-header">💭 Thinking</div><div class="thinking-text"></div>';
+    // Insert before the streaming message or at the end
+    const streamEl = document.getElementById('chat-streaming');
+    // Guard: streamEl might have been removed/replaced by reloadCurrentSessionMessages
+    // between check and insert. Use contains() for safety.
+    if (streamEl && messagesDiv.contains(streamEl)) {
+      messagesDiv.insertBefore(panel, streamEl);
+    } else {
+      messagesDiv.appendChild(panel);
+    }
+  }
+  return panel;
+}
+
+function hideThinkingPanel() {
+  const panel = document.getElementById('chat-thinking-panel');
+  if (panel) panel.style.display = 'none';
+}
+
+function ensureToolCards() {
+  if (!state._wsToolCards) state._wsToolCards = new Map();
+  return state._wsToolCards;
+}
+
+function finalizeWsChat() {
+  // Guard: prevent double-call race. chat.done fires once from WS,
+  // but sendViaWebSocket also calls finalizeWsChat from onDone handler,
+  // and the finally block (sendChatMessage) also runs cleanup. Two calls
+  // cause reloadCurrentSessionMessages to race and destroy captured text.
+  if (state._finalizeInProgress) return;
+  state._finalizeInProgress = true;
+
+  state._wsToolCards = null;
+  const elapsed = ((Date.now() - (state._chatStartTime || 0)) / 1000).toFixed(1);
+  const elapsedEl = document.getElementById('chat-status-elapsed');
+  if (elapsedEl) elapsedEl.textContent = elapsed + 's';
+  const stopBtn = document.getElementById('chat-stop-btn');
+  if (stopBtn) stopBtn.style.display = 'none';
+  const sendBtn = document.getElementById('chat-send-btn');
+  if (sendBtn) { sendBtn.style.display = ''; sendBtn.disabled = false; sendBtn.textContent = 'Send'; }
+
+  // Reset status indicator
+  const indicator = document.getElementById('agent-status-indicator');
+  if (indicator) {
+    indicator.textContent = 'ready';
+    indicator.className = 'status-idle';
+  }
+
+  // Hide subagent panel after delay
+  setTimeout(() => {
+    const panel = document.getElementById('subagent-panel');
+    if (panel && panel.children.length <= 1) panel.style.display = 'none';
+  }, 6000);
+
+  // CAPTURE streaming text BEFORE removing streamEl.
+  // chat.done fires BEFORE Hermes finishes writing the final message to SQLite,
+  // so reloadCurrentSessionMessages() may miss the streaming content.
+  const streamEl = document.getElementById('chat-streaming');
+  let capturedText = '';
+  if (streamEl) {
+    const span = streamEl.querySelector('#gw-stream-text');
+    if (span) capturedText = span.textContent || '';
+    streamEl.remove();
+  }
+  // Also remove any orphaned thinking panel
+  const thinkEl = document.getElementById('chat-thinking-panel');
+  if (thinkEl) thinkEl.remove();
+
+  // Reload from DB for clean final render, then merge captured streaming text
+  // in case the final message hadn't been written to DB yet.
+  if (state._currentChatSession) {
+    reloadCurrentSessionMessages().then(() => {
+      // Merge captured streaming text if the last assistant message has no body
+      if (capturedText) {
+        const messagesDiv = document.getElementById('chat-messages');
+        if (messagesDiv) {
+          const lastMsg = messagesDiv.querySelector('.msg-assistant:last-child');
+          const lastBody = lastMsg?.querySelector('.msg-body');
+          if (lastBody && !lastBody.textContent?.trim()) {
+            lastBody.innerHTML = renderChatContent(capturedText.substring(0, 8000));
+            highlightCodeBlocks(lastBody);
+          }
+        }
+      }
+    }).finally(() => {
+      state._finalizeInProgress = false;
+    }).catch((e) => {
+      state._finalizeInProgress = false;
+      console.error('[Chat] reload error:', e);
+    });
+  } else {
+    state._finalizeInProgress = false;
+  }
+  refreshChatSidebar();
+  updateChatHeader();
+  state._chatLock = false;
+  // Play completion sound if enabled
+  playChatComplete();
+
+  // Dequeue pending messages
+  if (state._chatQueue && state._chatQueue.length > 0) {
+    const next = state._chatQueue.shift();
+    updateQueueBadge();
+    const input = document.getElementById('chat-input');
+    if (input) { input.value = next; input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 120) + 'px'; }
+    setTimeout(() => sendChatMessage(), 300);
+  }
+}
+
+function showChatError(error) {
+  const messagesDiv = document.getElementById('chat-messages');
+  if (messagesDiv) {
+    messagesDiv.innerHTML += `<div class="chat-msg msg-system"><div class="msg-body" style="color:var(--error)">❌ ${escapeHtml(error)}</div></div>`;
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  }
+  const stopBtn = document.getElementById('chat-stop-btn');
+  if (stopBtn) stopBtn.style.display = 'none';
+  const sendBtn = document.getElementById('chat-send-btn');
+  if (sendBtn) sendBtn.style.display = '';
+}
+
+// ── Send via WebSocket ──
+async function sendViaWebSocket(text, profile, sessionId) {
+  return new Promise((resolve, reject) => {
+    const messagesDiv = document.getElementById('chat-messages');
+    if (!messagesDiv) { reject(new Error('No chat container')); return; }
+
+    // User message ALREADY added by sendChatMessage() — don't add again
+    state._chatStartTime = Date.now();
+    state._wsToolCards = new Map();
+
+    // Use the streaming element created by sendChatMessage()
+    let streamEl = document.getElementById('chat-streaming');
+    if (!streamEl) {
+      // Fallback: create if missing
+      streamEl = document.createElement('div');
+      streamEl.id = 'chat-streaming';
+      streamEl.className = 'chat-msg msg-assistant';
+      streamEl.innerHTML = '<div class="msg-header"><span class="msg-header-label">🤖 Assistant</span></div><div class="msg-body"><span id="gw-stream-text"></span></div>';
+      messagesDiv.appendChild(streamEl);
+    }
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+    // Show stop button, hide send
+    const stopBtn = document.getElementById('chat-stop-btn');
+    const sendBtn = document.getElementById('chat-send-btn');
+    if (stopBtn) stopBtn.style.display = '';
+    if (sendBtn) sendBtn.style.display = 'none';
+
+    // One-time listener for completion
+    function onDone(ev) {
+      const msg = ev.detail;
+      if (msg.type === 'chat.done') {
+        wsClient.removeEventListener('message', onDone);
+        finalizeWsChat();
+        resolve();
+      } else if (msg.type === 'chat.error') {
+        wsClient.removeEventListener('message', onDone);
+        showChatError(msg.error);
+        reject(new Error(msg.error));
+      }
+    }
+    wsClient.addEventListener('message', onDone);
+
+    // Send via WS
+    const ok = wsClient.chatStart({ message: text, profile, session_id: sessionId });
+    if (!ok) {
+      wsClient.removeEventListener('message', onDone);
+      reject(new Error('WebSocket not connected'));
+    }
+  });
 }
 
 // ── CLI Fallback Chat (legacy) ──
@@ -989,7 +1868,7 @@ function addToolCallCard(contentDiv, callId, name, args) {
     </div>`;
   // Insert before cursor
   const cursor = contentDiv.querySelector('.chat-cursor');
-  if (cursor) {
+  if (cursor && contentDiv.contains(cursor)) {
     contentDiv.insertBefore(card, cursor);
   } else {
     contentDiv.appendChild(card);
@@ -1013,13 +1892,23 @@ function finalizeToolCard(toolCards, callId, result) {
   el.classList.add('expanded');
   const resultEl = el.querySelector(`#tool-result-${callId}`) || el.querySelector('.tool-card-result');
   if (resultEl && result) {
-    const display = typeof result === 'string' ? result.substring(0, 500) : JSON.stringify(result).substring(0, 500);
-    resultEl.innerHTML = `<pre>${escapeHtml(display)}</pre>`;
+    const display = typeof result === 'string' ? result.substring(0, 4000) : JSON.stringify(result).substring(0, 4000);
+    const fullLen = typeof result === 'string' ? result.length : JSON.stringify(result).length;
+    if (fullLen > 4000) {
+      resultEl.innerHTML = `
+        <pre class="tool-result-truncated">${escapeHtml(display)}</pre>
+        <button class="tool-expand-btn" onclick="this.previousElementSibling.classList.toggle('tool-result-truncated'); this.previousElementSibling.classList.toggle('tool-result-full'); this.textContent = this.previousElementSibling.classList.contains('tool-result-full') ? 'Show less' : 'Show more (${(fullLen - 4000).toLocaleString()} more chars)';">Show more (${(fullLen - 4000).toLocaleString()} more chars)</button>`;
+      resultEl.classList.add('has-expand');
+    } else {
+      resultEl.innerHTML = `<pre>${escapeHtml(display)}</pre>`;
+    }
   }
 }
 
 function updateStreamContent(contentDiv, fullContent, toolCards, messagesDiv, elapsed) {
   if (!contentDiv) return;
+  // Guard: if contentDiv is no longer in the DOM (stream finalized), skip
+  if (!document.contains(contentDiv)) return;
   // Use a dedicated text span for streaming content (avoid full DOM rebuild)
   let textSpan = contentDiv.querySelector('#gw-stream-text');
   if (!textSpan) {
@@ -1027,9 +1916,9 @@ function updateStreamContent(contentDiv, fullContent, toolCards, messagesDiv, el
     textSpan.id = 'gw-stream-text';
     // Insert after any existing tool cards
     const lastCard = contentDiv.querySelector('.tool-call-card:last-of-type');
-    if (lastCard && lastCard.nextSibling) {
+    if (lastCard && contentDiv.contains(lastCard) && lastCard.nextSibling && contentDiv.contains(lastCard.nextSibling)) {
       contentDiv.insertBefore(textSpan, lastCard.nextSibling);
-    } else if (lastCard) {
+    } else if (lastCard && contentDiv.contains(lastCard)) {
       lastCard.after(textSpan);
     } else {
       contentDiv.prepend(textSpan);
@@ -1054,65 +1943,97 @@ function updateStreamContent(contentDiv, fullContent, toolCards, messagesDiv, el
 
 function renderChatContent(text) {
   if (!text) return '';
-  let html = escapeHtml(toDisplayText(text));
+  text = toDisplayText(text);
 
-  // Code blocks ```lang ... ```
-  html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (match, lang, code) => {
-    const langClass = lang ? `language-${lang}` : '';
-    const langLabel = lang ? `<span style="position:absolute;top:4px;left:10px;font-size:9px;text-transform:uppercase;letter-spacing:0.06em;color:var(--fg-subtle);">${escapeHtml(lang)}</span>` : '';
-    return `<pre style="position:relative;">${langLabel}<button class="code-copy-btn" onclick="copyCodeBlock(this)">Copy</button><code class="${langClass}">${code.trim()}</code></pre>`;
+  // ── 1. Extract code blocks FIRST (before any escaping) ──
+  const codeBlocks = [];
+  let html = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (match, lang, code) => {
+    const id = codeBlocks.length;
+    codeBlocks.push({ lang: lang || '', code: escapeHtml(code.trimEnd()) });
+    return `\x00CODE${id}\x00`;
   });
 
-  // Inline code
-  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // ── 2. Escape everything outside code blocks ──
+  html = escapeHtml(html);
 
+  // ── 3. Markdown formatting (safe — text already escaped) ──
   // Bold
   html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-
   // Italic
   html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-
-  // Headers (### → h4, ## → h3, # → h2)
-  html = html.replace(/^### (.+)$/gm, '<h4 style="font-size:13px;font-weight:700;margin:10px 0 4px;color:var(--fg);">$1</h4>');
-  html = html.replace(/^## (.+)$/gm, '<h3 style="font-size:14px;font-weight:700;margin:12px 0 6px;color:var(--fg);">$1</h3>');
-  html = html.replace(/^# (.+)$/gm, '<h2 style="font-size:15px;font-weight:700;margin:14px 0 8px;color:var(--fg);">$1</h2>');
-
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Headers
+  html = html.replace(/^#### (.+)$/gm, '<h4 style="font-size:12px;font-weight:700;margin:8px 0 4px;color:var(--fg);">$1</h4>');
+  html = html.replace(/^### (.+)$/gm, '<h3 style="font-size:13px;font-weight:700;margin:10px 0 4px;color:var(--fg);">$1</h3>');
+  html = html.replace(/^## (.+)$/gm, '<h2 style="font-size:14px;font-weight:700;margin:12px 0 6px;color:var(--fg);">$1</h2>');
+  html = html.replace(/^# (.+)$/gm, '<h1 style="font-size:15px;font-weight:700;margin:14px 0 8px;color:var(--fg);">$1</h1>');
   // Blockquotes
-  html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
-
-  // Unordered lists (- item)
-  html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
-  html = html.replace(/(<li>[\s\S]*?<\/li>)/g, '<ul>$1</ul>');
-  // Fix nested <ul> wrapping
-  html = html.replace(/<\/ul>\s*<ul>/g, '');
-
-  // Ordered lists (1. item)
-  html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
-
+  html = html.replace(/^&gt; (.+)$/gm, '<blockquote style="border-left:3px solid var(--accent);padding-left:10px;margin:6px 0;color:var(--fg-subtle);">$1</blockquote>');
   // Links [text](url)
   html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-
   // Horizontal rules
   html = html.replace(/^---$/gm, '<hr style="border:none;border-top:1px solid var(--border);margin:10px 0;">');
 
-  // Tables (basic support)
-  html = html.replace(/\|(.+)\|\n\|[-| ]+\|\n((?:\|.+\|\n?)+)/g, (match, headerRow, bodyRows) => {
-    const headers = headerRow.split('|').map(h => h.trim()).filter(Boolean);
-    const rows = bodyRows.trim().split('\n').map(row =>
-      row.split('|').map(c => c.trim()).filter(Boolean)
+  // ── 4. Restore code blocks ──
+  codeBlocks.forEach((cb, i) => {
+    const langClass = cb.lang ? `language-${cb.lang}` : '';
+    const langLabel = cb.lang ? `<span style="position:absolute;top:4px;left:10px;font-size:9px;text-transform:uppercase;letter-spacing:0.06em;color:var(--fg-subtle);">${escapeHtml(cb.lang)}</span>` : '';
+    html = html.replace(
+      `\x00CODE${i}\x00`,
+      `<pre style="position:relative;padding-top:22px;">${langLabel}<button class="code-copy-btn" onclick="copyCodeBlock(this)">Copy</button><code class="${langClass}">${cb.code}</code></pre>`
     );
-    let table = '<table><thead><tr>' + headers.map(h => `<th>${h}</th>`).join('') + '</tr></thead><tbody>';
-    for (const row of rows) {
-      table += '<tr>' + row.map(c => `<td>${c}</td>`).join('') + '</tr>';
-    }
-    table += '</tbody></table>';
-    return table;
   });
 
-  // Line breaks (preserve double newlines as paragraph breaks)
-  html = html.replace(/\n\n/g, '</p><p>');
+  // ── 5. Lists (process after code blocks restored) ──
+  // Collect ALL list items first, then wrap adjacent ones in <ul>/<ol>
+  const listReplacements = [];
+  // Unordered: capture individual - items (non-greedy, won't eat across items)
+  html = html.replace(/^- ([\s\S]*?)$/gm, (_, content) => {
+    const id = listReplacements.length;
+    listReplacements.push({ type: 'ul', content, id });
+    return `\x00LISTITEM${id}\x00`;
+  });
+  // Ordered: capture individual 1. items
+  html = html.replace(/^\d+\. ([\s\S]*?)$/gm, (_, content) => {
+    const id = listReplacements.length;
+    listReplacements.push({ type: 'ol', content, id });
+    return `\x00LISTITEM${id}\x00`;
+  });
+  // Group consecutive same-type list items
+  const grouped = [];
+  for (const item of listReplacements) {
+    const last = grouped[grouped.length - 1];
+    if (last && last.type === item.type) {
+      last.items.push(item.content);
+    } else {
+      grouped.push({ type: item.type, items: [item.content] });
+    }
+  }
+  // Restore as <ul>/<ol>
+  grouped.forEach((g, gi) => {
+    const items = g.items.map((c, i) => `<li>${c}</li>`).join('');
+    const tag = `<${g.type}>${items}</${g.type}>`;
+    html = html.replace(`\x00LISTITEM${gi}\x00`, tag);
+  });
+  // Clean up any stray unreplaced list placeholders (shouldn't happen)
+  html = html.replace(/\x00LISTITEM\d+\x00/g, '');
+
+  // ── 6. Paragraphs ──
+  // Split on double newlines, wrap each chunk in <p>
+  const chunks = html.split(/(?:&lt;br&gt;){2,}|\n\n/).filter(Boolean);
+  if (chunks.length > 1) {
+    html = chunks.map(c => {
+      const trimmed = c.trim();
+      if (trimmed.startsWith('<pre') || trimmed.startsWith('<blockquote') || trimmed.startsWith('<h') || trimmed.startsWith('<hr') || trimmed.startsWith('<ul') || trimmed.startsWith('<li')) return c;
+      return `<p>${trimmed}</p>`;
+    }).join('');
+  } else if (!html.startsWith('<') || html.startsWith('<em>') || html.startsWith('<strong>')) {
+    html = `<p>${html}</p>`;
+  }
+
+  // Single line breaks inside paragraphs → <br>
   html = html.replace(/\n/g, '<br>');
-  if (!html.startsWith('<')) html = '<p>' + html + '</p>';
 
   return html;
 }
@@ -1139,15 +2060,227 @@ function highlightCodeBlocks(container) {
   });
 }
 
-function createMessageDiv(role, content) {
+function createMessageDiv(role, content, optId) {
   const cls = { user: 'msg-user', assistant: 'msg-assistant' }[role] || 'msg-assistant';
+  // Dedup: skip if exact user message with same content was sent in last 10s
+  if (role === 'user' && isDuplicateUserMessage(content)) {
+    console.warn('[Chat] Skipping duplicate user message');
+    return document.createElement('div'); // empty, invisible
+  }
   const div = document.createElement('div');
   div.className = `chat-msg ${cls}`;
+  if (optId) div.dataset.optId = optId;
   const body = document.createElement('div');
   body.className = 'msg-body';
   body.textContent = content;
   div.appendChild(body);
   return div;
+}
+
+/** 3-layer dedup buffer */
+function addToDedupBuf(role, content) {
+  if (!state._recentMessages) state._recentMessages = { buf: [], max: 20 };
+  const b = state._recentMessages;
+  b.buf.unshift({ role, content, ts: Date.now() });
+  if (b.buf.length > b.max) b.buf.length = b.max;
+}
+
+/** Check if user message is a dupe within 10s / last 5 messages */
+function isDuplicateUserMessage(content) {
+  const b = state._recentMessages?.buf;
+  if (!b?.length) return false;
+  const win = 10000; // 10 seconds
+  const recent = b.slice(0, 5);
+  return recent.some(m => m.role === 'user' && m.content === content && Date.now() - m.ts < win);
+}
+
+/** Swap optimistic user message when server confirms session */
+function swapOptimisticMessage(sessionId) {
+  if (!state._currentChatSession && sessionId) {
+    state._currentChatSession = sessionId;
+  }
+  if (state._optMessages?.size > 0) {
+    // Clear optimistic markers once we have a real session
+    for (const [optId, entry] of state._optMessages) {
+      if (entry.el) entry.el.dataset.optId = '';
+    }
+    state._optMessages.clear();
+  }
+}
+
+/** Update chat UI connection status indicator */
+function updateWsConnectionUI(connected) {
+  // Find or create the connection indicator in chat header
+  let indicator = document.getElementById('ws-conn-indicator');
+  if (!indicator) {
+    // Create it — insert into chat-header-right area
+    const header = document.getElementById('chat-header-right');
+    if (header) {
+      indicator = document.createElement('span');
+      indicator.id = 'ws-conn-indicator';
+      indicator.title = 'WebSocket connection';
+      header.appendChild(indicator);
+    }
+  }
+  if (indicator) {
+    indicator.textContent = connected ? '🟢 ws' : '🔴 ws';
+    indicator.title = connected ? 'WebSocket connected' : 'WebSocket disconnected — reconnecting...';
+    indicator.style.cssText = 'font-size:10px;margin-left:6px;cursor:default;';
+  }
+  // Also update agent-status-indicator if it exists
+  const agentIndicator = document.getElementById('agent-status-indicator');
+  if (agentIndicator) {
+    if (!connected) {
+      agentIndicator.textContent = 'reconnecting';
+      agentIndicator.className = 'status-busy';
+    }
+  }
+}
+
+/** Phase 3: Update gateway health badge in chat header */
+async function updateGatewayBadge() {
+  const badge = document.getElementById('chat-gateway-badge');
+  if (!badge) return;
+  const profile = document.getElementById('chat-profile')?.value || 'default';
+  try {
+    const res = await fetch(`/api/gateway/${encodeURIComponent(profile)}/health`);
+    if (!res.ok) throw new Error('not ok');
+    const data = await res.json();
+    if (data.healthy && data.port) {
+      badge.textContent = `🌐 ${data.port}`;
+      badge.className = 'chat-header-badge badge-healthy';
+      badge.title = `Gateway healthy — mode: ${data.gatewayMode}`;
+    } else {
+      badge.textContent = '⚠️ DOWN';
+      badge.className = 'chat-header-badge badge-down';
+      badge.title = (data.issues || []).join('; ');
+    }
+  } catch {
+    badge.textContent = '⚠️ ERR';
+    badge.className = 'chat-header-badge badge-down';
+    badge.title = 'Gateway health check failed';
+  }
+}
+
+/** Phase 3: Fork session from a specific message index */
+async function forkFromMessage(msgIndex) {
+  const sid = state._currentChatSession;
+  if (!sid) return;
+  const profile = document.getElementById('chat-profile')?.value || 'default';
+  try {
+    const res = await fetch(`/api/chat/fork?profile=${encodeURIComponent(profile)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-csrf-token': state.csrfToken || '' },
+      credentials: 'include',
+      body: JSON.stringify({ sessionId: sid, messageIndex: msgIndex }),
+    });
+    const data = await res.json();
+    if (data.ok && data.newSessionId) {
+      await refreshChatSidebar();
+      await loadChatSession(data.newSessionId);
+    } else {
+      console.warn('[Fork] failed:', data.error);
+    }
+  } catch (e) {
+    console.warn('[Fork] error:', e);
+  }
+}
+
+/** Play a subtle completion sound when a chat response finishes */
+function playChatComplete() {
+  if (!state._soundEnabled) return;
+  if (!state._soundEl) {
+    try {
+      state._soundEl = new (window.AudioContext || window.webkitAudioContext)();
+      state._soundReady = true;
+    } catch (e) {
+      console.warn('[Chat] AudioContext not available:', e);
+      return;
+    }
+  }
+  try {
+    const src = state._soundEl.createBufferSource();
+    src.buffer = state._soundEl.createBuffer(1, state._soundEl.sampleRate * 0.12, state._soundEl.sampleRate);
+    const data = src.buffer.getChannelData(0);
+    for (let i = 0; i < data.length; i++) {
+      const t = i / state._soundEl.sampleRate;
+      const freq1 = 523, freq2 = 1047, beepDur = 0.06;
+      const fade = Math.min(i, data.length - i) / (state._soundEl.sampleRate * 0.015);
+      data[i] = (t < beepDur ? Math.sin(2 * Math.PI * freq1 * t) :
+                t < beepDur * 2 ? 0 : Math.sin(2 * Math.PI * freq2 * (t - beepDur * 2)) * 0.6) * 0.2 * fade;
+    }
+    const gain = state._soundEl.createGain();
+    gain.gain.value = 0.4;
+    src.connect(gain);
+    gain.connect(state._soundEl.destination);
+    src.start();
+  } catch (e) {
+    console.warn('[Chat] Failed to play completion sound:', e);
+  }
+}
+
+/** Toggle chat sound notifications */
+function toggleChatSound() {
+  state._soundEnabled = !state._soundEnabled;
+  const btn = document.getElementById('chat-sound-btn');
+  if (btn) btn.textContent = state._soundEnabled ? '🔔' : '🔕';
+  if (state._soundEnabled && !state._soundEl) {
+    try {
+      state._soundEl = new (window.AudioContext || window.webkitAudioContext)();
+      state._soundReady = true;
+    } catch (e) { /* AudioContext blocked until user gesture */ }
+  }
+  return state._soundEnabled;
+}
+
+/** Update live "running tools" count indicator in chat header */
+function updateToolCountUI() {
+  const count = state._wsToolCount || 0;
+  let indicator = document.getElementById('tool-count-indicator');
+  if (!indicator) {
+    const header = document.getElementById('chat-header-right');
+    if (header) {
+      indicator = document.createElement('span');
+      indicator.id = 'tool-count-indicator';
+      header.appendChild(indicator);
+    }
+  }
+  if (indicator) {
+    if (count > 0) {
+      indicator.textContent = `🔨 ${count} tool${count > 1 ? 's' : ''} running`;
+      indicator.style.cssText = 'font-size:10px;margin-left:6px;color:var(--gold);cursor:default;';
+    } else {
+      indicator.textContent = '';
+    }
+  }
+}
+
+/** Render an artifact card from the gateway */
+function handleArtifact(artifact) {
+  if (!artifact) return;
+  const messagesDiv = document.getElementById('chat-messages');
+  if (!messagesDiv) return;
+  const type = artifact.type || 'file';
+  const name = artifact.name || 'artifact';
+  const description = artifact.description || '';
+  const content = artifact.content || '';
+  const language = artifact.language || '';
+
+  const card = document.createElement('div');
+  card.className = 'artifact-card';
+  card.innerHTML = `
+    <div class="artifact-header" onclick="this.parentElement.classList.toggle('expanded')">
+      <span class="artifact-icon">${type === 'code' ? '💻' : type === 'image' ? '🖼️' : type === 'text' ? '📄' : '📦'}</span>
+      <span class="artifact-name">${escapeHtml(name)}</span>
+      ${description ? `<span class="artifact-desc">${escapeHtml(description)}</span>` : ''}
+      <span class="artifact-chevron">▶</span>
+    </div>
+    <div class="artifact-body">
+      ${content ? `<pre class="artifact-content ${language ? 'language-' + escapeHtml(language) : ''}">${escapeHtml(content.substring(0, 8000))}</pre>` : '<div class="artifact-empty">No content</div>'}
+    </div>`;
+  messagesDiv.appendChild(card);
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  state._artifactCount = (state._artifactCount || 0) + 1;
 }
 
 // ============================================
@@ -1179,8 +2312,8 @@ async function loadHome(container) {
   `;
 
   try {
-    const [healthRes, profilesRes, agentRes, cronRes] = await Promise.all([
-      api('/api/system/health'),
+    const [monRes, profilesRes, agentRes, cronRes] = await Promise.all([
+      api('/api/monitoring'),
       api('/api/profiles'),
       api('/api/agent/status'),
       api('/api/cron/list', { method: 'POST', body: '{}' }),
@@ -1188,7 +2321,40 @@ async function loadHome(container) {
 
     // Row 1: System Health + Agent Overview (merged)
     const cardsEl = document.getElementById('home-cards');
-    if (healthRes.ok) {
+    if (monRes.ok) {
+      const m = monRes;
+      cardsEl.innerHTML = `
+        <div class="card">
+          <div class="card-title">System Health</div>
+          <div class="stat-row"><span class="stat-label">CPU</span><span class="stat-value">${m.cpu || 'N/A'}</span></div>
+          <div class="stat-row"><span class="stat-label">RAM</span><span class="stat-value">${m.memory || 'N/A'}</span></div>
+          <div class="stat-row"><span class="stat-label">Disk</span><span class="stat-value">${m.disk || 'N/A'}</span></div>
+          <div class="stat-row"><span class="stat-label">Load</span><span class="stat-value">${m.load ? `${m.load.avg1}, ${m.load.avg5}, ${m.load.avg15}` : 'N/A'}</span></div>
+          <div class="stat-row"><span class="stat-label">Processes</span><span class="stat-value">${m.processes || 0}</span></div>
+          <div class="stat-row"><span class="stat-label">Uptime</span><span class="stat-value">${m.uptime || 'N/A'}</span></div>
+        </div>
+        <div class="card">
+          <div class="card-title">System Details</div>
+          <div class="stat-row"><span class="stat-label">Network</span><span class="stat-value">${m.network ? `${m.network.interface} (${formatNumber(m.network.bytes)}B)` : 'N/A'}</span></div>
+          <div class="stat-row"><span class="stat-label">Node RSS</span><span class="stat-value">${m.node_memory ? `${m.node_memory.rss_mb} MB` : 'N/A'}</span></div>
+          <div class="stat-row"><span class="stat-label">Heap Used</span><span class="stat-value">${m.node_memory ? `${m.node_memory.heap_used_mb}/${m.node_memory.heap_total_mb} MB` : 'N/A'}</span></div>
+          <div class="stat-row"><span class="stat-label">Hermes</span><span class="stat-value">${m.hermes_version || 'N/A'}</span></div>
+          <div class="stat-row"><span class="stat-label">HCI</span><span class="stat-value">${m.hci_version || 'N/A'}</span></div>
+          <div class="stat-row"><span class="stat-label">Node.js</span><span class="stat-value">${m.node_version || 'N/A'}</span></div>
+        </div>
+        <div class="card">
+          <div class="card-title">Agent Overview</div>
+          <div class="stat-row"><span class="stat-label">Model</span><span class="stat-value">${agentRes.ok ? (agentRes.model || 'N/A') : 'N/A'}</span></div>
+          <div class="stat-row"><span class="stat-label">Provider</span><span class="stat-value">${agentRes.ok ? (agentRes.provider || 'N/A') : 'N/A'}</span></div>
+          <div class="stat-row"><span class="stat-label">Gateway</span><span class="stat-value ${agentRes.ok && agentRes.gatewayStatus?.includes('running') ? 'status-ok' : 'status-off'}">${agentRes.ok ? (agentRes.gatewayStatus || 'N/A') : 'N/A'}</span></div>
+          <div class="stat-row"><span class="stat-label">API Keys</span><span class="stat-value">${agentRes.ok ? `${agentRes.apiKeys?.active || 0}/${agentRes.apiKeys?.total || 0} active` : 'N/A'}</span></div>
+          <div class="stat-row"><span class="stat-label">Platforms</span><span class="stat-value">${agentRes.ok ? (agentRes.platforms?.filter(p => p.configured).map(p => p.name).join(', ') || 'None') : 'N/A'}</span></div>
+          <div class="stat-row"><span class="stat-label">Cron</span><span class="stat-value">${cronRes?.jobs?.length || 0} jobs</span></div>
+          <div class="stat-row"><span class="stat-label">Sessions</span><span class="stat-value">${agentRes.ok ? `${agentRes.activeSessions || 0} active` : 'N/A'}</span></div>
+        </div>
+      `;
+    } else if (healthRes.ok) {
+      // Fallback to /api/system/health if /api/monitoring fails
       cardsEl.innerHTML = `
         <div class="card">
           <div class="card-title">System Health</div>
@@ -1226,7 +2392,7 @@ async function loadHome(container) {
     loadHomeAuth();
 
   } catch (e) {
-    document.getElementById('home-cards').innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+    document.getElementById('home-cards').innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
   }
 }
 
@@ -1554,7 +2720,7 @@ async function loadAgents(container) {
       grid.innerHTML = '<div class="card"><div class="card-title">No agents found</div><div class="stat-row"><span class="stat-label">Create your first agent profile to get started.</span></div></div>';
     }
   } catch (e) {
-    document.getElementById('agents-grid').innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+    document.getElementById('agents-grid').innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
   }
 }
 
@@ -1604,7 +2770,7 @@ async function loadAgentDetail(container, params) {
       </div>
       <div style="display:flex;gap:8px;">
         <button class="btn btn-ghost" onclick="openTerminalPanel('Setup ${name}', 'hermes -p ${name} setup')">⚙ Setup</button>
-        <button class="btn btn-primary" onclick="openTerminalPanel('Terminal ${name}', 'hermes -p ${name}')">⌘ Terminal</button>
+        <button class="btn btn-primary" onclick="openTerminalPanel('Terminal ${name}', '${name} --tui')">⌘ Terminal</button>
         <button class="btn btn-ghost" onclick="navigate('agents')">← Back</button>
       </div>
     </div>
@@ -1687,7 +2853,7 @@ async function loadAgentDashboard(container, name) {
     `;
     loadTokenUsage(`agent-token-${name}`, 1);
   } catch (e) {
-    container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+    container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
   }
 }
 
@@ -1753,7 +2919,7 @@ window.loadAgentSkills = async function(container, name) {
       </details>
     `;
   } catch (e) {
-    container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+    container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
   }
 }
 
@@ -1869,7 +3035,7 @@ async function loadAgentSessions(container, name) {
       state.currentSessions = res.sessions;
       renderSessions('');
     } catch (e) {
-      tableEl.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+      tableEl.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
     }
   }
 
@@ -1986,7 +3152,7 @@ async function toggleSessionDetail(btn, sessionId, profile) {
   cell.innerHTML = '<div class="loading" style="padding:16px;">Loading messages...</div>';
 
   try {
-    const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages?profile=${encodeURIComponent(profile)}`, { credentials: 'include' });
+    const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages?profile=${encodeURIComponent(profile)}&offset=0&limit=50`, { credentials: 'include' });
     if (!r.ok) { cell.innerHTML = '<div class="error-msg" style="padding:16px;">Failed to load messages</div>'; return; }
     const data = await r.json();
     if (!data.messages || data.messages.length === 0) {
@@ -2067,8 +3233,8 @@ async function loadSessionStats(name) {
 }
 
 async function resumeSession(sessionId) {
-  const agent = state.currentAgent || 'david';
-  const cmd = `hermes -p ${agent} -r ${sessionId}`;
+  const agent = state.currentAgent || state._defaultProfile || 'default';
+  const cmd = `${agent} --tui -r ${sessionId}`;
   openTerminalPanel(`Resume: ${sessionId}`, cmd);
 }
 
@@ -2229,7 +3395,7 @@ async function loadXtermAndConnect(command) {
     observer.observe(document.body, { childList: true });
 
   } catch (e) {
-    bodyEl.innerHTML = `<div style="color:var(--red);padding:20px;">Failed to load terminal: ${e.message}</div>`;
+    bodyEl.innerHTML = `<div style="color:var(--red);padding:20px;">Failed to load terminal: ${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -2329,7 +3495,7 @@ async function loadAgentGateway(container, name) {
     renderGatewayHealth(document.getElementById('gateway-health'), name);
 
   } catch (e) {
-    container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+    container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
   }
 }
 
@@ -2450,7 +3616,7 @@ async function loadGatewayLogs(name) {
       viewer.innerHTML = '<div class="empty">No logs available</div>';
     }
   } catch (e) {
-    viewer.innerHTML = `<div class="error-msg">${e.message}</div>`;
+    viewer.innerHTML = `<div class="error-msg">${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -2746,7 +3912,7 @@ async function loadAgentConfig(container, name) {
     });
 
   } catch (e) {
-    container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+    container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
   }
 }
 
@@ -2845,7 +4011,7 @@ async function loadAgentMemory(container, name) {
       </div>
     `;
   } catch (e) {
-    container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+    container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
   }
 }
 
@@ -3416,7 +4582,7 @@ async function loadSkills(container) {
 
       contentEl.innerHTML = html;
     } catch (e) {
-      contentEl.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+      contentEl.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
     }
   }
 
@@ -3483,7 +4649,7 @@ window.inspectSkill = async function(name) {
       </div>
     `;
   } catch (e) {
-    overlay.querySelector('.modal-card').innerHTML = `<div class="modal-title">Error</div><div class="error-msg">${e.message}</div><button class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()" style="margin-top:12px;">Close</button>`;
+    overlay.querySelector('.modal-card').innerHTML = `<div class="modal-title">Error</div><div class="error-msg">${escapeHtml(e.message)}</div><button class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()" style="margin-top:12px;">Close</button>`;
   }
 }
 
@@ -3545,7 +4711,7 @@ window.doInstallSkill = async function(skillName) {
       if (statusEl) statusEl.innerHTML = `<div style="color:var(--err);margin-top:8px;">❌ ${escapeHtml(res.output || res.error || 'Install failed')}</div>`;
     }
   } catch (e) {
-    if (statusEl) statusEl.innerHTML = `<div style="color:var(--err);margin-top:8px;">❌ ${e.message}</div>`;
+    if (statusEl) statusEl.innerHTML = `<div style="color:var(--err);margin-top:8px;">❌ ${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -3594,7 +4760,7 @@ async function loadUsersPage(container) {
       el.innerHTML = '<div class="stat-row"><span class="stat-label">No users</span></div>';
     }
   } catch (e) {
-    document.getElementById('users-page-list').innerHTML = `<div class="error-msg">${e.message}</div>`;
+    document.getElementById('users-page-list').innerHTML = `<div class="error-msg">${escapeHtml(e.message)}</div>`;
   }
 
   // Load audit log for the page
@@ -3641,7 +4807,7 @@ async function loadAuditLogPage() {
       el.innerHTML = '<div class="stat-row"><span class="stat-label">No audit entries</span></div>';
     }
   } catch (e) {
-    document.getElementById('audit-log-page').innerHTML = `<div class="error-msg">${e.message}</div>`;
+    document.getElementById('audit-log-page').innerHTML = `<div class="error-msg">${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -3774,7 +4940,7 @@ async function loadUsers() {
     }
   } catch (e) {
     const el = document.getElementById('users-list');
-    if (el) el.innerHTML = `<div class="error-msg">${e.message}</div>`;
+    if (el) el.innerHTML = `<div class="error-msg">${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -4049,7 +5215,7 @@ async function runDump() {
     const res = await api('/api/dump');
     el.innerHTML = `<pre style="font-size:10px;white-space:pre-wrap;max-height:300px;overflow-y:auto;color:var(--fg-muted);">${escapeHtml(res.output || 'No output')}</pre>`;
   } catch (e) {
-    el.innerHTML = `<div class="error-msg">${e.message}</div>`;
+    el.innerHTML = `<div class="error-msg">${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -4971,7 +6137,7 @@ async function loadFileExplorer(container, dirPath = '') {
 
     treeEl.innerHTML = breadcrumb + (itemsHtml || '<div class="empty">Empty directory</div>');
   } catch (e) {
-    document.getElementById('file-tree').innerHTML = `<div class="error-msg">${e.message}</div>`;
+    document.getElementById('file-tree').innerHTML = `<div class="error-msg">${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -5237,6 +6403,166 @@ async function loadLogs(container) {
   }
 
   refreshLogs();
+}
+
+// ============================================
+// Monitoring Page
+// ============================================
+async function loadMonitoring(container) {
+  container.innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title">System Monitor</div>
+        <div class="page-subtitle">Real-time system resource metrics</div>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-ghost" onclick="loadMonitoring(document.querySelector('.page.active'))">↻ Refresh</button>
+      </div>
+    </div>
+
+    <!-- Key metrics bar -->
+    <div id="mon-overview" class="mon-overview" style="margin-top:12px;">
+      <div class="loading">Loading metrics…</div>
+    </div>
+
+    <!-- Metrics grid -->
+    <div id="mon-grid" class="mon-grid" style="margin-top:16px;">
+      <div class="mon-card" id="mon-cpu">
+        <div class="mon-card-title">CPU Usage</div>
+        <div class="mon-card-body">
+          <div class="mon-big-val" id="mon-cpu-val">—</div>
+          <div class="mon-sub" id="mon-cpu-sub">%</div>
+        </div>
+      </div>
+      <div class="mon-card" id="mon-mem">
+        <div class="mon-card-title">Memory</div>
+        <div class="mon-card-body">
+          <div class="mon-big-val" id="mon-mem-val">—</div>
+          <div class="mon-sub" id="mon-mem-sub">MB</div>
+        </div>
+      </div>
+      <div class="mon-card" id="mon-disk">
+        <div class="mon-card-title">Disk</div>
+        <div class="mon-card-body">
+          <div class="mon-big-val" id="mon-disk-val">—</div>
+          <div class="mon-sub" id="mon-disk-sub"></div>
+        </div>
+      </div>
+      <div class="mon-card" id="mon-procs">
+        <div class="mon-card-title">Processes</div>
+        <div class="mon-card-body">
+          <div class="mon-big-val" id="mon-procs-val">—</div>
+          <div class="mon-sub">running</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Secondary metrics -->
+    <div id="mon-secondary" class="mon-grid" style="margin-top:16px;">
+      <div class="mon-card" id="mon-load">
+        <div class="mon-card-title">Load Average</div>
+        <div class="mon-card-body" style="display:flex;gap:16px;align-items:baseline;">
+          <div><div class="mon-big-val" style="font-size:16px;" id="mon-load1">—</div><div class="mon-sub" style="font-size:10px;">1m</div></div>
+          <div><div class="mon-big-val" style="font-size:16px;" id="mon-load5">—</div><div class="mon-sub" style="font-size:10px;">5m</div></div>
+          <div><div class="mon-big-val" style="font-size:16px;" id="mon-load15">—</div><div class="mon-sub" style="font-size:10px;">15m</div></div>
+        </div>
+      </div>
+      <div class="mon-card" id="mon-net">
+        <div class="mon-card-title">Network I/O</div>
+        <div class="mon-card-body" style="display:flex;flex-direction:column;gap:4px;">
+          <div class="mon-stat-row"><span class="mon-stat-label">Interface</span><span class="mon-stat-val" id="mon-net-iface">—</span></div>
+          <div class="mon-stat-row"><span class="mon-stat-label">Bytes</span><span class="mon-stat-val" id="mon-net-bytes">—</span></div>
+          <div class="mon-stat-row"><span class="mon-stat-label">Packets</span><span class="mon-stat-val" id="mon-net-packets">—</span></div>
+        </div>
+      </div>
+      <div class="mon-card" id="mon-node-mem">
+        <div class="mon-card-title">Node.js Memory</div>
+        <div class="mon-card-body" style="display:flex;flex-direction:column;gap:4px;">
+          <div class="mon-stat-row"><span class="mon-stat-label">RSS</span><span class="mon-stat-val" id="mon-node-rss">—</span></div>
+          <div class="mon-stat-row"><span class="mon-stat-label">Heap Used</span><span class="mon-stat-val" id="mon-node-heap">—</span></div>
+          <div class="mon-stat-row"><span class="mon-stat-label">Heap Total</span><span class="mon-stat-val" id="mon-node-heap-total">—</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- System info -->
+    <div id="mon-info" class="mon-grid" style="margin-top:16px;">
+      <div class="mon-card">
+        <div class="mon-card-title">Uptime</div>
+        <div class="mon-card-body">
+          <div class="mon-big-val" style="font-size:18px;" id="mon-uptime-val">—</div>
+        </div>
+      </div>
+      <div class="mon-card">
+        <div class="mon-card-title">Versions</div>
+        <div class="mon-card-body" style="display:flex;flex-direction:column;gap:4px;">
+          <div class="mon-stat-row"><span class="mon-stat-label">HCI</span><span class="mon-stat-val" id="mon-ver-hci">—</span></div>
+          <div class="mon-stat-row"><span class="mon-stat-label">Hermes</span><span class="mon-stat-val" id="mon-ver-hermes">—</span></div>
+          <div class="mon-stat-row"><span class="mon-stat-label">Node.js</span><span class="mon-stat-val" id="mon-ver-node">—</span></div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // Fetch and render metrics
+  await refreshMonitoring();
+
+  // Auto-refresh every 5 seconds
+  if (state._monInterval) clearInterval(state._monInterval);
+  state._monInterval = setInterval(() => refreshMonitoring(), 5000);
+}
+
+async function refreshMonitoring() {
+  try {
+    const r = await api('/api/monitoring');
+    if (!r.ok) {
+      document.getElementById('mon-overview').innerHTML = `<div class="error-msg">${r.error || 'Failed to load metrics'}</div>`;
+      return;
+    }
+
+    // Overview bar
+    document.getElementById('mon-overview').innerHTML = `
+      <div class="mon-overview-inner">
+        <div class="mon-ov-item"><span class="mon-ov-label">CPU</span><span class="mon-ov-val">${r.cpu || '—'}</span></div>
+        <div class="mon-ov-item"><span class="mon-ov-label">Memory</span><span class="mon-ov-val">${r.memory || '—'}</span></div>
+        <div class="mon-ov-item"><span class="mon-ov-label">Disk</span><span class="mon-ov-val">${r.disk || '—'}</span></div>
+        <div class="mon-ov-item"><span class="mon-ov-label">Processes</span><span class="mon-ov-val">${r.processes || 0}</span></div>
+        <div class="mon-ov-item"><span class="mon-ov-label">Load</span><span class="mon-ov-val">${r.load?.avg1 || '—'}, ${r.load?.avg5 || '—'}, ${r.load?.avg15 || '—'}</span></div>
+      </div>
+    `;
+
+    // Primary metrics
+    document.getElementById('mon-cpu-val').textContent = r.cpu?.replace('%', '') || '—';
+    document.getElementById('mon-mem-val').textContent = (r.memory || '—').split(' ')[0] || '—';
+    document.getElementById('mon-mem-sub').textContent = (r.memory || '').includes('MB') ? 'MB' : '';
+    document.getElementById('mon-disk-val').textContent = (r.disk || '—').split(' ')[0] || '—';
+    document.getElementById('mon-disk-sub').textContent = (r.disk || '—').split(' ').slice(1).join(' ') || '';
+    document.getElementById('mon-procs-val').textContent = r.processes || 0;
+
+    // Load averages
+    document.getElementById('mon-load1').textContent = r.load?.avg1 || '—';
+    document.getElementById('mon-load5').textContent = r.load?.avg5 || '—';
+    document.getElementById('mon-load15').textContent = r.load?.avg15 || '—';
+
+    // Network
+    document.getElementById('mon-net-iface').textContent = r.network?.interface || '—';
+    document.getElementById('mon-net-bytes').textContent = formatNumber(parseInt(r.network?.bytes) || 0);
+    document.getElementById('mon-net-packets').textContent = formatNumber(parseInt(r.network?.packets) || 0);
+
+    // Node.js memory
+    document.getElementById('mon-node-rss').textContent = r.node_memory?.rss_mb ? `${r.node_memory.rss_mb} MB` : '—';
+    document.getElementById('mon-node-heap').textContent = r.node_memory?.heap_used_mb ? `${r.node_memory.heap_used_mb} MB` : '—';
+    document.getElementById('mon-node-heap-total').textContent = r.node_memory?.heap_total_mb ? `${r.node_memory.heap_total_mb} MB` : '—';
+
+    // System info
+    document.getElementById('mon-uptime-val').textContent = r.uptime || '—';
+    document.getElementById('mon-ver-hci').textContent = r.hci_version || '—';
+    document.getElementById('mon-ver-hermes').textContent = r.hermes_version || '—';
+    document.getElementById('mon-ver-node').textContent = r.node_version || '—';
+
+  } catch (e) {
+    // Silent fail on refresh errors
+  }
 }
 
 async function refreshLogs() {
@@ -5528,6 +6854,19 @@ window.togglePwVis = function(btn) {
   const input = btn.previousElementSibling;
   if (input.type === 'password') { input.type = 'text'; btn.textContent = '🙈'; }
   else { input.type = 'password'; btn.textContent = '👁'; }
+};
+
+function _isSessionPinned(sid) {
+  try { return JSON.parse(localStorage.getItem('hci_pinned_sessions') || '[]').includes(sid); } catch { return false; }
+}
+window.togglePinSession = function(sid) {
+  try {
+    const list = JSON.parse(localStorage.getItem('hci_pinned_sessions') || '[]');
+    const idx = list.indexOf(sid);
+    if (idx >= 0) list.splice(idx, 1); else list.push(sid);
+    localStorage.setItem('hci_pinned_sessions', JSON.stringify(list));
+    refreshChatSidebar();
+  } catch {}
 };
 window.sendChatMessage = sendChatMessage;
 window.loadChatSession = loadChatSession;
@@ -6149,5 +7488,41 @@ window.saveConfig = async function(profile, category) {
     }
   } catch (e) { showToast(e.message, 'error'); }
 };
+
+/** Phase 3: Toggle message ⋮ dropdown menu */
+function toggleMsgMenu(btn, role) {
+  // Close any existing menu first
+  closeMsgMenu();
+  // Build menu
+  const menu = document.createElement('div');
+  menu.className = 'msg-menu-dropdown';
+  menu.innerHTML = `<button class="msg-menu-item" onclick="forkFromMessageIdx(this)">🔱 Fork session here</button>`;
+  document.body.appendChild(menu);
+  // Position it relative to the button
+  const rect = btn.getBoundingClientRect();
+  menu.style.top = rect.bottom + window.scrollY + 2 + 'px';
+  menu.style.left = rect.left + window.scrollX + 'px';
+  // Store message index on the menu for the fork handler
+  const msgDiv = btn.closest('.chat-msg');
+  const msgs = Array.from(msgDiv.parentElement.querySelectorAll('.chat-msg'));
+  const idx = msgs.indexOf(msgDiv);
+  menu.dataset.msgIdx = idx;
+  menu.dataset.role = role;
+  // Close on outside click
+  setTimeout(() => { document.addEventListener('click', closeMsgMenu, { once: true }); }, 0);
+}
+
+/** Phase 3: Close message menu */
+function closeMsgMenu() {
+  document.querySelectorAll('.msg-menu-dropdown').forEach(m => m.remove());
+}
+
+/** Phase 3: Fork session from the stored message index */
+async function forkFromMessageIdx(el) {
+  closeMsgMenu();
+  const menu = el.closest('.msg-menu-dropdown');
+  const msgIdx = parseInt(menu?.dataset?.msgIdx || '0', 10);
+  await forkFromMessage(msgIdx);
+}
 
 init();

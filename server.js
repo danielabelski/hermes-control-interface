@@ -12,10 +12,14 @@ const { WebSocketServer } = require('ws');
 const rateLimit = require('express-rate-limit');
 const yaml = require('js-yaml');
 const Database = require('better-sqlite3');
+const { getConfig } = require('./lib/hci-config');
 const {
   mergeSessionsFromSources,
   parseHermesSessionsList,
 } = require('./lib/session-list');
+
+// ── TUI Gateway Bridge ──
+const { getBridge, killAllBridges } = require('./lib/tui-gateway-bridge');
 
 // ── LLM Pricing (via @pydantic/genai-prices) ──
 const { calcPrice } = require('@pydantic/genai-prices');
@@ -104,12 +108,15 @@ function execHermes(args, timeout = 30000) {
   });
 }
 
-const PORT = Number(process.env.PORT || 10272);
-const CONTROL_PASSWORD = process.env.HERMES_CONTROL_PASSWORD;
-const CONTROL_SECRET = process.env.HERMES_CONTROL_SECRET;
-const AUTH_COOKIE = 'hermes_control_auth';
-const PROJECT_ROOT = __dirname;
-const PROJECTS_ROOT = process.env.HERMES_PROJECTS_ROOT || path.dirname(PROJECT_ROOT);
+// ── Load HCI config (hci.config.yaml + env overrides) ──
+const cfg = getConfig();
+
+const PORT            = cfg.port;
+const CONTROL_PASSWORD = cfg.password;
+const CONTROL_SECRET  = cfg.secret;
+const AUTH_COOKIE      = cfg.session.cookieName;
+const PROJECT_ROOT     = __dirname;
+const PROJECTS_ROOT    = cfg.projectsRoot;
 
 // Dynamic identity — works for root and non-root users
 const HCI_USER = os.userInfo().username;
@@ -130,48 +137,22 @@ if (!IS_ROOT && !process.env.XDG_RUNTIME_DIR) {
 
 
 // Cookie helper — conditionally adds Secure flag for HTTPS
-function setAuthCookie(res, token, maxAge = 86400) {
-  const secure = res.req?.secure || res.req?.get('X-Forwarded-Proto') === 'https';
+function setAuthCookie(res, token, maxAge = cfg.session.cookieMaxAge) {
+  const secure = cfg.session.secure !== null
+    ? cfg.session.secure
+    : res.req?.secure || res.req?.get('X-Forwarded-Proto') === 'https';
   res.setHeader('Set-Cookie', `${AUTH_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure ? '; Secure' : ''}`);
 }
 function clearAuthCookie(res) {
   res.setHeader('Set-Cookie', `${AUTH_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`);
 }
-const CONTROL_HOME = process.env.HERMES_CONTROL_HOME || path.join(os.homedir(), '.hermes');
+const CONTROL_HOME = cfg.hermesHome;
 const CONTROL_STATE_DIR = path.join(CONTROL_HOME, 'control-interface');
 const AVATAR_OVERRIDE_PATH = path.join(CONTROL_STATE_DIR, 'avatar.dataurl');
 const STATE_DB_PATH = path.join(CONTROL_HOME, 'state.db');
 
-function parseExplorerRoots(raw) {
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed) && parsed.length) {
-      return parsed.map((item, index) => {
-        if (typeof item === 'string') {
-          return { key: `root-${index + 1}`, label: item, root: item };
-        }
-        if (item && typeof item === 'object' && item.root) {
-          return {
-            key: String(item.key || `root-${index + 1}`),
-            label: String(item.label || item.root),
-            root: String(item.root),
-          };
-        }
-        return null;
-      }).filter(Boolean);
-    }
-  } catch {}
-  return String(raw)
-    .split(',')
-    .map((part, index) => part.trim())
-    .filter(Boolean)
-    .map((root, index) => ({ key: `root-${index + 1}`, label: root, root }));
-}
-
-const ROOTS = parseExplorerRoots(process.env.HERMES_CONTROL_ROOTS) || [
-  { key: 'hermes', label: CONTROL_HOME, root: CONTROL_HOME },
-];
+// Explorer roots — already parsed by hci-config.js
+const ROOTS = cfg.roots;
 const IGNORED_DIRS = new Set([
   'node_modules', '.git', 'cache', 'document_cache', 'audio_cache', 'checkpoints', 'logs', 'tmp', '.next', '.turbo', '.cache',
 ]);
@@ -205,12 +186,22 @@ app.use(express.static(path.join(__dirname, 'dist'), {
   maxAge: '365d',
   immutable: true,
   setHeaders: (res, filePath) => {
-    // HTML files should not be cached aggressively (they reference hashed assets)
+    // HTML files should NEVER be cached (they reference hashed assets)
     if (filePath.endsWith('.html')) {
-      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
     }
   },
 }));
+
+// API responses should NEVER be cached
+app.use('/api', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+});
 app.use('/vendor/xterm', express.static(path.join(__dirname, 'node_modules/@xterm/xterm'), { maxAge: '30d' }));
 app.use('/vendor/xterm-addon-fit', express.static(path.join(__dirname, 'node_modules/@xterm/addon-fit'), { maxAge: '30d' }));
 
@@ -277,7 +268,8 @@ const events = [];
 // Sending a message uses --resume with the real hermes session ID
 
 // ── Gateway API Proxy (fast, structured events) ────────────────────
-const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY || loadGatewayApiKey();
+// Gateway API key: explicit config → auto-discover from hermes config.yaml
+const GATEWAY_API_KEY = cfg.gatewayApiKey || loadGatewayApiKey();
 const HERMES_HOME = process.env.HERMES_HOME || path.join(os.homedir(), '.hermes');
 
 // Load gateway API key from default profile config.yaml
@@ -294,8 +286,10 @@ function loadGatewayApiKey() {
 }
 
 // Resolve CORS origins for gateway config injection
-// Priority: HCI_CORS_ORIGINS env var → auto-detect from request → sensible defaults
+// Priority: explicit config → HCI_CORS_ORIGINS env var → auto-detect from request
 function resolveCorsOrigins(req) {
+  // If loaded from config/env, use it directly (already comma-separated string)
+  if (cfg.corsOrigins) return cfg.corsOrigins;
   // If env var set, use it directly (comma-separated)
   if (process.env.HCI_CORS_ORIGINS) return process.env.HCI_CORS_ORIGINS;
   // Auto-detect from the incoming request origin
@@ -309,25 +303,27 @@ function resolveCorsOrigins(req) {
 // Scans ~/.hermes/config.yaml (default) + ~/.hermes/profiles/*/config.yaml
 function discoverGatewayPorts() {
   const ports = {};
+  const baseHermesHome = path.join(os.homedir(), '.hermes');
   try {
-    // Default profile: ~/.hermes/config.yaml
-    const defaultConf = fs.readFileSync(path.join(HERMES_HOME, 'config.yaml'), 'utf8');
+    // Default profile: ~/.hermes/config.yaml (base, not HERMES_HOME which may be profile-specific)
+    const defaultConf = fs.readFileSync(path.join(baseHermesHome, 'config.yaml'), 'utf8');
     const defaultCfg = yaml.load(defaultConf);
-    const ds = defaultCfg.platforms?.api_server;
+    // Check both platforms.api_server (injected) and top-level api_server (legacy)
+    const ds = defaultCfg.platforms?.api_server || defaultCfg.api_server;
     if (ds?.enabled && ds?.extra?.port) {
       ports['default'] = ds.extra.port;
     }
   } catch (_) { /* no default config */ }
 
   // Other profiles: ~/.hermes/profiles/<name>/config.yaml
-  const profilesDir = path.join(HERMES_HOME, 'profiles');
+  const profilesDir = path.join(baseHermesHome, 'profiles');
   try {
     for (const name of fs.readdirSync(profilesDir)) {
       try {
         const confPath = path.join(profilesDir, name, 'config.yaml');
         const raw = fs.readFileSync(confPath, 'utf8');
         const cfg = yaml.load(raw);
-        const apiSrv = cfg.platforms?.api_server;
+        const apiSrv = cfg.platforms?.api_server || cfg.api_server;
         if (apiSrv?.enabled && apiSrv?.extra?.port) {
           ports[name] = apiSrv.extra.port;
         }
@@ -356,6 +352,21 @@ function getGatewayBase(profile) {
   return `http://127.0.0.1:${port}`;
 }
 
+// Read default model from profile config.yaml
+function getDefaultModel(profile) {
+  const baseHermesHome = path.join(os.homedir(), '.hermes');
+  try {
+    const configPath = profile === 'default'
+      ? path.join(baseHermesHome, 'config.yaml')
+      : path.join(baseHermesHome, 'profiles', profile, 'config.yaml');
+    if (fs.existsSync(configPath)) {
+      const cfg = yaml.load(fs.readFileSync(configPath, 'utf8'));
+      return cfg?.model?.default || cfg?.model || 'moonshotai/kimi-k2.6';
+    }
+  } catch (_) { /* fallback */ }
+  return 'moonshotai/kimi-k2.6';
+}
+
 // GET /api/gateway/ports — discovered gateway API ports per profile
 app.get('/api/gateway/ports', requireAuth, (req, res) => {
   res.json({ ports: gatewayPorts, profiles: Object.keys(gatewayPorts) });
@@ -376,7 +387,7 @@ app.post('/api/gateway/responses', requireAuth, requirePerm('chat.use'), async (
     }
     console.log(`[GatewayChat] Routing to ${gatewayBase}/v1/responses`);
     const gatewayBody = {
-      model: model || 'glm-5.1',
+      model: model || getDefaultModel(profile || 'default'),
       input: message,
       stream,
     };
@@ -524,6 +535,160 @@ app.post('/api/chat/send', requireAuth, requirePerm('chat.use'), async (req, res
   } catch (e) {
     res.write(`data: ${JSON.stringify({ type: 'error', content: e.message })}\n\n`);
     res.end();
+  }
+});
+
+// POST /api/chat/fork — create a new session forked from a source session up to message_index
+app.post('/api/chat/fork', requireAuth, requireCsrf, requirePerm('chat.use'), (req, res) => {
+  const { sessionId, messageIndex, profile } = req.body || {};
+  if (!sessionId || typeof sessionId !== 'string') {
+    return res.status(400).json({ error: 'sessionId required' });
+  }
+  if (messageIndex == null || typeof messageIndex !== 'number' || messageIndex < 0) {
+    return res.status(400).json({ error: 'messageIndex must be a non-negative number' });
+  }
+
+  const prof = sanitizeProfileName(profile) || 'default';
+  const stateDbPath = getStateDbPath(prof);
+
+  if (!fs.existsSync(stateDbPath)) {
+    return res.status(404).json({ error: 'session store not found for profile: ' + prof });
+  }
+
+  let db;
+  try {
+    db = new Database(stateDbPath, { readonly: false });
+
+    // Verify source session exists
+    const sourceSession = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sessionId);
+    if (!sourceSession) {
+      return res.status(404).json({ error: 'source session not found' });
+    }
+
+    // Get messages for the source session, ordered by id, up to message_index (inclusive, 0-based)
+    // We use id <= (SELECT MIN(id) FROM messages WHERE session_id = ? AND rowid > ...) approach
+    // Simpler: grab all messages for this session sorted by id, slice to messageIndex + 1
+    const messages = db.prepare(`
+      SELECT * FROM messages WHERE session_id = ? ORDER BY id ASC
+    `).all(sessionId);
+
+    if (messageIndex >= messages.length) {
+      return res.status(400).json({ error: 'messageIndex out of range for this session' });
+    }
+
+    const messagesToFork = messages.slice(0, messageIndex + 1);
+
+    // Generate new session ID: YYYYMMDD_HHMMSS_randomHex
+    const now = new Date();
+    const ts = now.toISOString().replace(/[-:T]/g, '').slice(0, 14).replace(/^(\d{8})(\d{6})$/, '$1_$2_');
+    const rand = crypto.randomBytes(4).toString('hex');
+    const newSessionId = ts + rand;
+
+    // Calculate message_count for forked session
+    const forkedMessageCount = messagesToFork.length;
+
+    // Copy the source session, but give it a new id and set parent_session_id
+    db.prepare(`
+      INSERT INTO sessions (
+        id, source, user_id, model, model_config, system_prompt,
+        parent_session_id, started_at, ended_at, end_reason,
+        message_count, tool_call_count, input_tokens, output_tokens,
+        cache_read_tokens, cache_write_tokens, reasoning_tokens,
+        billing_provider, billing_base_url, billing_mode,
+        estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
+        pricing_version, title, api_call_count
+      ) VALUES (
+        @id, @source, @user_id, @model, @model_config, @system_prompt,
+        @parent_session_id, @started_at, @ended_at, @end_reason,
+        @message_count, @tool_call_count, @input_tokens, @output_tokens,
+        @cache_read_tokens, @cache_write_tokens, @reasoning_tokens,
+        @billing_provider, @billing_base_url, @billing_mode,
+        @estimated_cost_usd, @actual_cost_usd, @cost_status, @cost_source,
+        @pricing_version, @title, @api_call_count
+      )
+    `).run({
+      id: newSessionId,
+      source: sourceSession.source,
+      user_id: sourceSession.user_id,
+      model: sourceSession.model,
+      model_config: sourceSession.model_config,
+      system_prompt: sourceSession.system_prompt,
+      parent_session_id: sessionId,
+      started_at: Date.now() / 1000,
+      ended_at: null,
+      end_reason: null,
+      message_count: forkedMessageCount,
+      tool_call_count: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_write_tokens: 0,
+      reasoning_tokens: 0,
+      billing_provider: sourceSession.billing_provider,
+      billing_base_url: sourceSession.billing_base_url,
+      billing_mode: sourceSession.billing_mode,
+      estimated_cost_usd: null,
+      actual_cost_usd: null,
+      cost_status: null,
+      cost_source: null,
+      pricing_version: sourceSession.pricing_version,
+      title: sourceSession.title ? (sourceSession.title + ' (fork)') : null,
+      api_call_count: 0,
+    });
+
+    // Copy messages to the new session
+    const insertMsg = db.prepare(`
+      INSERT INTO messages (
+        session_id, role, content, tool_call_id, tool_calls, tool_name,
+        timestamp, token_count, finish_reason, reasoning, reasoning_details,
+        codex_reasoning_items, reasoning_content, codex_message_items
+      ) VALUES (
+        @session_id, @role, @content, @tool_call_id, @tool_calls, @tool_name,
+        @timestamp, @token_count, @finish_reason, @reasoning, @reasoning_details,
+        @codex_reasoning_items, @reasoning_content, @codex_message_items
+      )
+    `);
+
+    for (const msg of messagesToFork) {
+      insertMsg.run({
+        session_id: newSessionId,
+        role: msg.role,
+        content: msg.content,
+        tool_call_id: msg.tool_call_id,
+        tool_calls: msg.tool_calls,
+        tool_name: msg.tool_name,
+        timestamp: msg.timestamp,
+        token_count: msg.token_count,
+        finish_reason: msg.finish_reason,
+        reasoning: msg.reasoning,
+        reasoning_details: msg.reasoning_details,
+        codex_reasoning_items: msg.codex_reasoning_items,
+        reasoning_content: msg.reasoning_content,
+        codex_message_items: msg.codex_message_items,
+      });
+    }
+
+    // Invalidate sessions caches so the new session appears
+    hermesSidebarSessionsCache = { at: 0, data: [] };
+    hermesAllSessionsCache = { at: 0, data: [] };
+
+    res.json({
+      ok: true,
+      newSessionId,
+      forkedSession: {
+        id: newSessionId,
+        title: sourceSession.title ? (sourceSession.title + ' (fork)') : null,
+        parent_session_id: sessionId,
+        message_count: forkedMessageCount,
+        model: sourceSession.model,
+        started_at: Date.now() / 1000,
+      },
+    });
+  } catch (e) {
+    console.error('[chat.fork] error:', e.message);
+    res.status(500).json({ error: 'failed to fork session: ' + e.message });
+  } finally {
+    if (db) db.close();
   }
 });
 
@@ -744,17 +909,6 @@ const terminalRateLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-function formatBytes(bytes) {
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let idx = 0;
-  let value = bytes;
-  while (value >= 1024 && idx < units.length - 1) {
-    value /= 1024;
-    idx += 1;
-  }
-  return `${value.toFixed(value >= 10 || idx === 0 ? 0 : 1)} ${units[idx]}`;
-}
-
 function trimTerminalBuffer(text, limit = 50000) {
   const raw = String(text || '');
   return raw.length > limit ? raw.slice(raw.length - limit) : raw;
@@ -934,8 +1088,10 @@ function safeStat(filePath) {
 }
 
 function readFileSafe(filePath, maxBytes = 120_000) {
+  // Use actual Hermes home (env var takes precedence, then config, then ~/.hermes)
+  const HERMES = process.env.HERMES_HOME || cfg.hermesHome || path.join(os.homedir(), '.hermes');
   const rel = String(filePath || '').replace(/^\/+/, '');
-  const abs = path.resolve(CONTROL_HOME, rel);
+  const abs = path.resolve(HERMES, rel);
   if (!isAllowedPath(abs)) throw new Error('path outside allowed roots');
   const stat = safeStat(abs);
   if (!stat) throw new Error('file not found');
@@ -945,8 +1101,9 @@ function readFileSafe(filePath, maxBytes = 120_000) {
 }
 
 function writeFileSafe(filePath, content) {
+  const HERMES = process.env.HERMES_HOME || cfg.hermesHome || path.join(os.homedir(), '.hermes');
   const rel = String(filePath || '').replace(/^\/+/, '');
-  const abs = path.resolve(CONTROL_HOME, rel);
+  const abs = path.resolve(HERMES, rel);
   if (!isAllowedPath(abs)) throw new Error('path outside allowed roots');
   const stat = safeStat(abs);
   if (!stat) throw new Error('file not found');
@@ -997,17 +1154,6 @@ function buildExplorerRoot({ key, label, root }) {
     root,
     children: listDirectory(root, 0, 2, 140, root),
   };
-}
-
-function getProjects() {
-  try {
-    return fs.readdirSync(PROJECTS_ROOT, { withFileTypes: true })
-      .filter((e) => e.isDirectory() && !IGNORED_DIRS.has(e.name))
-      .map((e) => ({ name: e.name, path: path.join(PROJECTS_ROOT, e.name) }))
-      .sort((a, b) => a.name.localeCompare(b.name));
-  } catch {
-    return [];
-  }
 }
 
 function readLayoutStore() {
@@ -1183,9 +1329,12 @@ async function getSessions() {
 let hermesAllSessionsCache = { at: 0, data: [] };
 
 function getStateDbPath(profile) {
-  return profile && profile !== 'default'
-    ? path.join(os.homedir(), '.hermes', 'profiles', profile, 'state.db')
-    : STATE_DB_PATH;
+  // Named profiles (soci, david, cuan…) live under profiles/{name}/state.db
+  // The default/unnamed profile uses Hermes root-level state.db
+  if (profile && profile !== 'default') {
+    return path.join(os.homedir(), '.hermes', 'profiles', profile, 'state.db');
+  }
+  return path.join(os.homedir(), '.hermes', 'state.db');
 }
 
 function loadSessionsFromDb(stateDbPath, limit = 250) {
@@ -1725,7 +1874,7 @@ app.post('/api/auth/login', loginRateLimiter, (req, res) => {
 });
 
 // Logout
-app.post('/api/auth/logout', requireAuth, (req, res) => {
+app.post('/api/auth/logout', requireAuth, requireCsrf, (req, res) => {
   const user = getCurrentUser(req);
   const cookies = parseCookies(req);
   const token = cookies[AUTH_COOKIE];
@@ -1828,19 +1977,19 @@ app.get('/api/notifications', requireAuth, (req, res) => {
 });
 
 // Support both /api/notifications/:id/dismiss (URL param) and /api/notifications/dismiss (body id)
-app.post('/api/notifications/:id/dismiss', requireAuth, (req, res) => {
+app.post('/api/notifications/:id/dismiss', requireAuth, requireCsrf, (req, res) => {
   const id = req.params.id || req.body?.id;
   if (id) dismissNotification(id);
   res.json({ ok: true });
 });
 
-app.post('/api/notifications/dismiss', requireAuth, (req, res) => {
+app.post('/api/notifications/dismiss', requireAuth, requireCsrf, (req, res) => {
   const id = req.body?.id;
   if (id) dismissNotification(id);
   res.json({ ok: true });
 });
 
-app.post('/api/notifications/clear', requireAuth, (req, res) => {
+app.post('/api/notifications/clear', requireAuth, requireCsrf, (req, res) => {
   clearNotifications();
   res.json({ ok: true });
 });
@@ -1875,6 +2024,80 @@ app.get('/api/system/health', requireAuth, async (req, res) => {
       node_version: process.version,
       agents: Math.max(0, parseInt(agents.trim()) - 2) || 0, // subtract header lines
       sessions: Math.max(0, parseInt(sessions.trim()) - 2) || 0,
+    });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// System Monitoring — detailed metrics
+app.get('/api/monitoring', requireAuth, async (req, res) => {
+  try {
+    const [cpu, mem, disk, loadAvg, netio, processes, uptime, version] = await Promise.all([
+      shell("top -bn1 | grep 'Cpu(s)' | awk '{print $2}'"),
+      shell("free -m | awk '/Mem:/ {printf \"%d/%dMB (%.1f%%)\", $3, $2, $3/$2*100}'"),
+      shell("df -h / | awk 'NR==2 {print $3\"/\"$2\" (\"$5\")\"}'"),
+      shell("cat /proc/loadavg | awk '{print $1\", \"$2\", \"$3}'"),
+      shell("cat /proc/net/dev | awk 'NR==3 {print $1, $9}'"),
+      shell("ps aux --no-headers | wc -l"),
+      shell("uptime | awk -F'up ' '{split($2,a,\" user\");print a[1]\", \"$3}'"),
+      shell("hermes version 2>&1 | head -1"),
+    ]);
+
+    // Parse network interface (skip loopback)
+    const netParts = (netio || 'lo 0').trim().split(/\s+/);
+    const netInterface = netParts[0] || 'eth0';
+    const netBytes = netParts[1] || '0';
+    const netPackets = netParts[2] || '0';
+
+    // CPU percentage (already in format like "12.5%")
+    const cpuPct = (cpu.trim() || 'N/A').replace(/,/g, '');
+
+    // Memory usage
+    const memInfo = mem.trim() || 'N/A';
+
+    // Disk usage
+    const diskInfo = disk.trim() || 'N/A';
+
+    // Load averages
+    const loadParts = (loadAvg.trim() || '0, 0, 0').split(',').map(l => l.trim());
+    const load1 = loadParts[0] || '0';
+    const load5 = loadParts[1] || '0';
+    const load15 = loadParts[2] || '0';
+
+    // Process count
+    const procCount = parseInt(processes.trim()) || 0;
+
+    // Uptime info
+    const upInfo = uptime.trim() || 'N/A';
+
+    // Hermes version
+    const hermesVer = version.trim() || 'N/A';
+    const hciVer = require('./package.json').version;
+
+    // Node.js memory usage (RSS, HeapUsed, HeapTotal)
+    const nodeMem = process.memoryUsage();
+    const nodeMemRSS = Math.round(nodeMem.rss / 1024 / 1024);
+    const nodeMemHeapUsed = Math.round(nodeMem.heapUsed / 1024 / 1024);
+    const nodeMemHeapTotal = Math.round(nodeMem.heapTotal / 1024 / 1024);
+
+    res.json({
+      ok: true,
+      cpu: cpuPct,
+      memory: memInfo,
+      disk: diskInfo,
+      load: { avg1: load1, avg5: load5, avg15: load15 },
+      network: { interface: netInterface, bytes: netBytes, packets: netPackets },
+      processes: procCount,
+      uptime: upInfo,
+      hermes_version: hermesVer,
+      hci_version: hciVer,
+      node_version: process.version,
+      node_memory: {
+        rss_mb: nodeMemRSS,
+        heap_used_mb: nodeMemHeapUsed,
+        heap_total_mb: nodeMemHeapTotal,
+      },
     });
   } catch (e) {
     res.json({ ok: false, error: e.message });
@@ -2009,8 +2232,10 @@ async function getProfiles() {
   const now = Date.now();
   if (getProfiles.cache && now - getProfiles.cache.at < 15_000) return getProfiles.cache.data;
   const raw = await shell('hermes profile list');
+  console.log('[DEBUG getProfiles] raw shell output:', JSON.stringify(raw));
   if (raw) {
     const data = parseHermesProfileList(raw);
+    console.log('[DEBUG getProfiles] parsed:', JSON.stringify(data));
     getProfiles.cache = { at: now, data };
     return data;
   }
@@ -2021,6 +2246,7 @@ getProfiles.cache = { at: 0, data: [] };
 
 app.get('/api/profiles', requireAuth, async (req, res) => {
   const profiles = await getProfiles();
+  console.log('[DEBUG /api/profiles] returning:', JSON.stringify(profiles));
   res.json({ ok: true, profiles });
 });
 
@@ -2028,7 +2254,7 @@ app.post('/api/profiles/use', requireRole('admin'), requireCsrf, async (req, res
   const name = sanitizeProfileName(req.body?.profile);
   if (!name) return res.status(400).json({ error: 'invalid profile name (allowed: a-z, A-Z, 0-9, _, -)' });
   try {
-    const result = await shell(`hermes profile use ${name}`, '10s');
+    const result = await execHermes(['profile', 'use', name], 10000);
     // Invalidate profiles cache so next fetch shows updated active profile
     getProfiles.cache = { at: 0, data: [] };
     res.json({ ok: true, profile: name, output: result.trim() });
@@ -2401,7 +2627,8 @@ app.get('/api/file', requireAuth, (req, res) => {
   if (!requested) return res.status(400).json({ error: 'path required' });
   try {
     const content = readFileSafe(requested);
-    return res.json({ ok: true, path: path.resolve(CONTROL_HOME, requested.replace(/^\/+/, '')), content });
+    const HERMES = process.env.HERMES_HOME || cfg.hermesHome || path.join(os.homedir(), '.hermes');
+    return res.json({ ok: true, path: path.resolve(HERMES, requested.replace(/^\/+/, '')), content });
   } catch (error) {
     const message = error.message || 'file read failed';
     const status = message.includes('EISDIR') ? 400 : message.includes('not found') ? 404 : 400;
@@ -3332,7 +3559,7 @@ app.get('/api/memory/:profile', requireAuth, async (req, res) => {
 app.get('/api/skills/browse/:page', requireAuth, async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.params.page) || 1);
-    const output = await shell(`hermes skills browse --page ${page} 2>&1`, '15s');
+    const output = await execHermes(['skills', 'browse', '--page', String(page)], 15000);
     res.json({ ok: true, output, page });
   } catch (e) {
     res.json({ ok: false, error: e.message });
@@ -3385,8 +3612,8 @@ app.get('/api/skills/list/:profile', requireAuth, async (req, res) => {
   try {
     const profile = sanitizeProfileName(req.params.profile);
     if (!profile) return res.status(400).json({ ok: false, error: 'invalid profile name' });
-    const flag = profile === 'default' ? '' : ` --profile ${profile}`;
-    const output = await shell(`hermes${flag} skills list 2>&1`, '15s');
+    const profArg = profile === 'default' ? [] : ['-p', profile];
+    const output = await execHermes([...profArg, 'skills', 'list'], 15000);
     res.json({ ok: true, output });
   } catch (e) {
     res.json({ ok: false, error: e.message });
@@ -3398,6 +3625,7 @@ app.post('/api/skills/install', requireRole('admin'), requireCsrf, async (req, r
   try {
     const { skill, profile } = req.body || {};
     if (!skill) return res.status(400).json({ ok: false, error: 'skill name required' });
+    if (!/^[\w.\-]+$/.test(skill)) return res.status(400).json({ ok: false, error: 'invalid skill name' });
     const profArg = profile ? ['-p', sanitizeProfileName(profile)] : [];
     const output = await execHermes([...profArg, 'skills', 'install', skill, '--yes'], 30000);
     const success = !output.includes('error') && !output.includes('Error');
@@ -3437,11 +3665,11 @@ app.post('/api/skills/update', requireRole('admin'), requireCsrf, async (req, re
 });
 
 // Skills check updates
-app.post('/api/skills/check', requireAuth, async (req, res) => {
+app.post('/api/skills/check', requireAuth, requireCsrf, async (req, res) => {
   try {
     const { profile } = req.body || {};
-    const flag = profile ? `-p ${sanitizeProfileName(profile)} ` : '';
-    const output = await shell(`hermes ${flag}skills check 2>&1`, '30s');
+    const profArg = profile ? ['-p', sanitizeProfileName(profile)] : [];
+    const output = await execHermes([...profArg, 'skills', 'check'], 30000);
     // Parse table output
     const lines = output.split('\n');
     const updates = [];
@@ -3593,8 +3821,13 @@ app.post('/api/backup/import', requireRole('admin'), requireCsrf, (req, res) => 
 });
 
 app.get('/api/backup/download', requireRole('admin'), (req, res) => {
-  const filePath = req.query.path;
-  if (!filePath || !filePath.endsWith('.zip') || filePath.includes('..')) {
+  const rawPath = req.query.path;
+  if (!rawPath || !rawPath.endsWith('.zip')) {
+    return res.status(400).json({ error: 'Invalid path' });
+  }
+  const filePath = path.resolve(rawPath);
+  // Backups are always created in /tmp/ — reject anything outside
+  if (!filePath.startsWith('/tmp/')) {
     return res.status(400).json({ error: 'Invalid path' });
   }
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found' });
@@ -3704,9 +3937,9 @@ app.get('/api/sessions/:id/export', requireAuth, async (req, res) => {
     const sessionId = sanitizeSessionId(req.params.id);
     if (!sessionId) return res.status(400).json({ ok: false, error: 'invalid session id' });
     const tmpFile = `/tmp/session-${crypto.randomUUID()}.jsonl`;
-    const output = await shell(`hermes sessions export ${tmpFile} --session-id ${sessionId} 2>&1`);
-    const data = await shell(`cat ${tmpFile} 2>/dev/null`);
-    await shell(`rm -f ${tmpFile}`);
+    const output = await execHermes(['sessions', 'export', tmpFile, '--session-id', sessionId]);
+    const data = await fs.promises.readFile(tmpFile, 'utf8').catch(() => output);
+    await fs.promises.unlink(tmpFile).catch(() => {});
     res.json({ ok: true, data: data || output });
   } catch (e) {
     res.json({ ok: false, error: e.message });
@@ -3724,7 +3957,7 @@ app.get('/api/sessions/:id/messages', requireAuth, (req, res) => {
     const profile = sanitizeProfileName(req.query.profile);
     const stateDbPath = profile && profile !== 'default'
       ? path.join(os.homedir(), '.hermes', 'profiles', profile, 'state.db')
-      : STATE_DB_PATH;
+      : path.join(os.homedir(), '.hermes', 'state.db');
 
     if (!fs.existsSync(stateDbPath)) {
       return res.json({ ok: false, error: `state.db not found for profile: ${profile || 'default'}` });
@@ -3807,7 +4040,7 @@ app.get('/api/usage/:days', requireAuth, requirePerm('usage.view'), async (req, 
     if (profile) {
       const p = profile !== 'default'
         ? path.join(os.homedir(), '.hermes', 'profiles', profile, 'state.db')
-        : STATE_DB_PATH;
+        : path.join(os.homedir(), '.hermes', 'state.db');
       if (!fs.existsSync(p)) return res.json({ ok: false, error: 'state.db not found' });
       dbPaths = [{ profile: profile || 'default', path: p }];
     } else {
@@ -3821,8 +4054,9 @@ app.get('/api/usage/:days', requireAuth, requirePerm('usage.view'), async (req, 
         }
       }
       // Include default profile
-      if (fs.existsSync(STATE_DB_PATH)) {
-        dbPaths.push({ profile: 'default', path: STATE_DB_PATH });
+      const defaultDbPath = path.join(os.homedir(), '.hermes', 'state.db');
+      if (fs.existsSync(defaultDbPath)) {
+        dbPaths.push({ profile: 'default', path: defaultDbPath });
       }
       if (dbPaths.length === 0) return res.json({ ok: false, error: 'No state.db found' });
     }
@@ -4014,7 +4248,7 @@ app.get('/api/usage/daily/:days', requireAuth, requirePerm('usage.view'), async 
     const profile = sanitizeProfileName(req.query.profile);
     const stateDbPath = profile && profile !== 'default'
       ? path.join(os.homedir(), '.hermes', 'profiles', profile, 'state.db')
-      : STATE_DB_PATH;
+      : path.join(os.homedir(), '.hermes', 'state.db');
 
     if (!fs.existsSync(stateDbPath)) {
       return res.json({ ok: false, error: 'state.db not found' });
@@ -4229,7 +4463,7 @@ app.get('/api/insights/:profile/:days', requireAuth, requirePerm('usage.view'), 
     const profile = sanitizeProfileName(req.params.profile);
     if (!profile) return res.status(400).json({ ok: false, error: 'invalid profile name' });
     const days = Math.min(parseInt(req.params.days || '7', 10), 90);
-    const output = await shell(`hermes --profile ${profile} insights --days ${days} 2>&1`, '60s');
+    const output = await execHermes(['--profile', profile, 'insights', '--days', String(days)], 60000);
     res.json({ ok: true, output });
   } catch (e) {
     res.json({ ok: false, error: e.message });
@@ -4289,6 +4523,8 @@ app.post('/api/hermes-cron/:profile/create', requireCsrf, async (req, res) => {
     if (!profile) return res.status(400).json({ ok: false, error: 'invalid profile name' });
     const { schedule, prompt, name, deliver, repeat } = req.body || {};
     if (!schedule) return res.status(400).json({ ok: false, error: 'schedule required' });
+    if (prompt && (typeof prompt !== 'string' || prompt.length > 10000)) return res.status(400).json({ ok: false, error: 'invalid prompt (max 10000 chars)' });
+    if (name && (typeof name !== 'string' || name.length > 128 || !/^[\w\s.\-:]+$/.test(name))) return res.status(400).json({ ok: false, error: 'invalid name (allowed: a-z, A-Z, 0-9, spaces, . - :, max 128 chars)' });
     const args = ['-p', profile, 'cron', 'create'];
     if (name) args.push('--name', name);
     if (deliver) args.push('--deliver', deliver);
@@ -4343,8 +4579,8 @@ app.put('/api/hermes-cron/:profile/:jobId', requireCsrf, async (req, res) => {
 });
 
 const server = (() => {
-  const sslCert = process.env.HCI_SSL_CERT_FILE;
-  const sslKey = process.env.HCI_SSL_KEY_FILE;
+  const sslCert = cfg.ssl.certFile;
+  const sslKey = cfg.ssl.keyFile;
   if (sslCert && sslKey) {
     if (!fs.existsSync(sslCert) || !fs.existsSync(sslKey)) {
       console.error(`SSL cert/key not found — cert: ${sslCert}, key: ${sslKey}`);
@@ -4375,6 +4611,130 @@ const server = (() => {
   });
   return server;
 })();
+
+// ── WebSocket Chat Gateway Bridge ──
+// Proxies Gateway API /v1/responses via WebSocket for real-time event streaming.
+async function handleWsChatStart(socket, msg) {
+  const { message, profile, session_id, model } = msg;
+  if (!message || typeof message !== 'string') {
+    socket.send(JSON.stringify({ type: 'chat.error', error: 'message required' }));
+    return;
+  }
+
+  const gatewayBase = getGatewayBase(profile || 'default');
+  if (!gatewayBase) {
+    socket.send(JSON.stringify({ type: 'chat.error', error: 'Gateway API not available for profile: ' + (profile || 'default') }));
+    return;
+  }
+
+  const gatewayBody = { model: model || getDefaultModel(profile || 'default'), input: message, stream: true };
+  const gwHeaders = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GATEWAY_API_KEY}` };
+  if (session_id) gwHeaders['X-Hermes-Session-Id'] = session_id;
+
+  try {
+    const gatewayRes = await fetch(`${gatewayBase}/v1/responses`, {
+      method: 'POST', headers: gwHeaders, body: JSON.stringify(gatewayBody),
+    });
+
+    if (!gatewayRes.ok) {
+      const errText = await gatewayRes.text();
+      socket.send(JSON.stringify({ type: 'chat.error', error: `Gateway ${gatewayRes.status}: ${errText}` }));
+      return;
+    }
+
+    const hermesSessionId = gatewayRes.headers.get('x-hermes-session-id') || '';
+    if (hermesSessionId) {
+      socket.send(JSON.stringify({ type: 'chat.session', session_id: hermesSessionId }));
+    }
+
+    const reader = gatewayRes.body.getReader();
+    socket.activeChatReader = reader;
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (socket.readyState !== 1) break; // socket closed
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || '';
+
+        for (const part of parts) {
+          const lines = part.split('\n');
+          let dataLine = '';
+          for (const line of lines) {
+            if (line.startsWith('data: ')) dataLine = line.slice(6);
+          }
+          if (!dataLine) continue;
+          try {
+            const evt = JSON.parse(dataLine);
+            // Transform SSE events to WS chat events
+            const wsEvent = transformGatewayEvent(evt);
+            if (wsEvent) {
+              socket.send(JSON.stringify({ type: 'chat.event', event: wsEvent }));
+            }
+          } catch {}
+        }
+      }
+    } catch (pipeErr) {
+      console.error('[WS Chat] pipe error:', pipeErr.message);
+    } finally {
+      socket.activeChatReader = null;
+      if (socket.readyState === 1) {
+        socket.send(JSON.stringify({ type: 'chat.done' }));
+      }
+    }
+  } catch (e) {
+    console.error('[WS Chat] error:', e.message);
+    socket.send(JSON.stringify({ type: 'chat.error', error: e.message }));
+    socket.activeChatReader = null;
+  }
+}
+
+function transformGatewayEvent(evt) {
+  const t = evt.type;
+  // Text streaming
+  if (t === 'response.output_text.delta') {
+    return { type: 'text.delta', delta: evt.delta || '' };
+  }
+  // Tool call started
+  if (t === 'response.output_item.added') {
+    const item = evt.item || {};
+    if (item.type === 'function_call' || item.type === 'tool_call') {
+      return { type: 'tool.start', call_id: item.call_id || item.id || ('tc_' + Date.now()), name: item.name, arguments: item.arguments || item.args };
+    }
+  }
+  // Tool progress
+  if (t === 'hermes.tool.progress') {
+    return { type: 'tool.progress', name: evt.name, preview: evt.preview };
+  }
+  // Tool call done
+  if (t === 'response.output_item.done') {
+    const item = evt.item || {};
+    if (item.type === 'function_call' || item.type === 'tool_call') {
+      return { type: 'tool.done', call_id: item.call_id || item.id, result: item.result || item.output || '' };
+    }
+  }
+  // Response completed
+  if (t === 'response.completed') {
+    return { type: 'response.completed', response_id: evt.response?.id };
+  }
+  // Session info (injected by HCI)
+  if (t === 'hci.session') {
+    return { type: 'session', session_id: evt.session_id };
+  }
+  // Reasoning / thinking
+  if (t === 'response.reasoning.delta' || t === 'response.thinking.delta') {
+    return { type: 'thinking.delta', delta: evt.delta || evt.text || '' };
+  }
+  // Status update
+  if (t === 'status.update') {
+    return { type: 'status', status: evt.status, kind: evt.kind };
+  }
+  return null;
+}
 
 const wss = new WebSocketServer({
   server,
@@ -4407,8 +4767,9 @@ async function broadcast() {
 
 wss.on('connection', async (socket, req) => {
   socket.authed = isAuthed(req);
+  socket.clientId = 'c' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  socket.activeChatReader = null; // for cancelling gateway streams
   if (!socket.authed) {
-    // Don't send dashboard data to unauthenticated connections
     socket.send(JSON.stringify({ type: 'auth-required', message: 'authentication required' }));
     return;
   }
@@ -4432,8 +4793,6 @@ wss.on('connection', async (socket, req) => {
       if (msg.type === 'terminal-input' && socket.authed) {
         let data = String(msg.data || '');
         if (data.length > 4096) return;
-        // Strip CPR responses (cursor position report) that leak through xterm
-        // Pattern: ESC[<n>;<m>R or residual ;1R sequences
         data = data.replace(/\x1b\[[0-9;]*R/g, '').replace(/;[0-9]+R/g, '');
         if (!data) return;
         const command = data.replace(/[\r\n]+$/g, '');
@@ -4462,7 +4821,81 @@ wss.on('connection', async (socket, req) => {
       if (msg.type === 'log-stop' && socket.authed) {
         stopLogStream();
       }
+      // ── Chat via WebSocket (TUI Gateway) ──
+      if (msg.type === 'chat.start' && socket.authed) {
+        console.log(`[WS] chat.start received profile="${msg.profile || 'default'}" session_id="${msg.session_id || 'null'}"`);
+        const bridge = getBridge(msg.profile || 'default');
+        if (!bridge.proc) {
+          let startErr = null;
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+              await bridge.start();
+              startErr = null;
+              break;
+            } catch (e) {
+              startErr = e;
+              console.error(`[WS] Bridge start attempt ${attempt}/3 failed:`, e.message);
+              if (attempt < 3) await new Promise(r => setTimeout(r, 500));
+            }
+          }
+          if (startErr) {
+            socket.send(JSON.stringify({ type: 'chat.error', error: 'TUI gateway unavailable after 3 retries. Falling back to CLI mode...' }));
+            // Don't return — let frontend fallback to CLI
+            // (frontend already has CLI fallback in sendChatMessage)
+            return;
+          }
+        }
+        bridge.addClient(socket);
+        socket.tuiBridge = bridge;
+        try {
+          const result = await bridge.chatStart(msg);
+          socket.tuiSessionId = result.session_id;
+        } catch (err) {
+          socket.send(JSON.stringify({ type: 'chat.error', error: err.message }));
+        }
+      }
+      if (msg.type === 'chat.stop' && socket.authed && socket.tuiBridge) {
+        socket.tuiBridge.chatStop(socket.tuiSessionId);
+      }
+      if (msg.type === 'clarify.respond' && socket.authed && socket.tuiBridge) {
+        try {
+          await socket.tuiBridge.respondClarify(msg.request_id, msg.text, msg.choice);
+        } catch (err) {
+          socket.send(JSON.stringify({ type: 'chat.error', error: err.message }));
+        }
+      }
+      if (msg.type === 'approval.respond' && socket.authed && socket.tuiBridge) {
+        try {
+          await socket.tuiBridge.respondApproval(msg.approve, msg.command);
+        } catch (err) {
+          socket.send(JSON.stringify({ type: 'chat.error', error: err.message }));
+        }
+      }
+      if (msg.type === 'sudo.respond' && socket.authed && socket.tuiBridge) {
+        try {
+          await socket.tuiBridge.respondSudo(msg.request_id, msg.password);
+        } catch (err) {
+          socket.send(JSON.stringify({ type: 'chat.error', error: err.message }));
+        }
+      }
+      if (msg.type === 'secret.respond' && socket.authed && socket.tuiBridge) {
+        try {
+          await socket.tuiBridge.respondSecret(msg.request_id, msg.value);
+        } catch (err) {
+          socket.send(JSON.stringify({ type: 'chat.error', error: err.message }));
+        }
+      }
     } catch {}
+  });
+  socket.on('close', () => {
+    if (socket.tuiBridge) {
+      socket.tuiBridge.removeClient(socket);
+      socket.tuiBridge = null;
+    }
+    if (socket.activeChatReader) {
+      socket.activeChatReader.cancel().catch(() => {});
+      socket.activeChatReader = null;
+    }
   });
 });
 
@@ -4485,6 +4918,8 @@ setInterval(() => {
 // Graceful shutdown
 function shutdown(signal) {
   log('system.shutdown', `received ${signal}, shutting down gracefully`);
+  // Kill TUI bridges
+  killAllBridges();
   // Kill PTY process
   if (terminalSession.proc) {
     try { terminalSession.proc.kill(); } catch {}
